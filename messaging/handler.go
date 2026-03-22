@@ -279,7 +279,7 @@ func (h *Handler) switchDefault(ctx context.Context, name string) string {
 
 	info := ag.Info()
 	log.Printf("[handler] switched default agent: %s -> %s (%s)", old, name, info)
-	return name
+	return fmt.Sprintf("switch to %s", name)
 }
 
 // buildStatus returns a short status string showing the current default agent.

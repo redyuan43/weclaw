@@ -7,11 +7,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Version is set at build time via -ldflags.
+var Version = "dev"
+
 var rootCmd = &cobra.Command{
-	Use:   "weclaw",
-	Short: "WeChat AI agent bridge",
-	Long:  "weclaw bridges WeChat messages to AI agents via the iLink API.",
-	RunE:  runStart, // default command is start
+	Use:     "weclaw",
+	Short:   "WeChat AI agent bridge",
+	Long:    "weclaw bridges WeChat messages to AI agents via the iLink API.",
+	Version: Version,
+	RunE:    runStart, // default command is start
 }
 
 // Execute runs the root command.

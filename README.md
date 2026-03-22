@@ -4,7 +4,37 @@
 
 WeChat AI Agent Bridge — connect WeChat to AI coding agents (Claude, Codex, Gemini, Kimi, etc.) via the [iLink](https://www.ilink.wiki) API.
 
-![Preview](preview.png)
+| | | |
+|:---:|:---:|:---:|
+| <img src="previews/preview1.png" width="280" /> | <img src="previews/preview2.png" width="280" /> | <img src="previews/preview3.png" width="280" /> |
+
+## Quick Start
+
+```bash
+# One-line install
+curl -sSL https://raw.githubusercontent.com/fastclaw-ai/weclaw/main/install.sh | sh
+
+# Start (first run will prompt QR code login)
+weclaw start
+```
+
+That's it. On first start, WeClaw will:
+1. Show a QR code — scan with WeChat to login
+2. Auto-detect installed AI agents (Claude, Codex, Gemini, etc.)
+3. Save config to `~/.weclaw/config.json`
+4. Start receiving and replying to WeChat messages
+
+Use `weclaw login` to add additional WeChat accounts.
+
+### Other install methods
+
+```bash
+# Via Go
+go install github.com/fastclaw-ai/weclaw@latest
+
+# Via Docker
+docker run -it -v ~/.weclaw:/root/.weclaw ghcr.io/fastclaw-ai/weclaw start
+```
 
 ## How It Works
 
@@ -39,45 +69,17 @@ WeChat Reply            AI Agent Process
 
 Auto-detection picks ACP over CLI when both are available.
 
-## Quick Start
-
-```bash
-# Install
-go install github.com/fastclaw-ai/weclaw@latest
-
-# Start (first run will prompt QR code login)
-weclaw start
-```
-
-On first start, WeClaw will prompt a QR code for WeChat login, then auto-detect installed agents and save the config to `~/.weclaw/config.json`. Use `weclaw login` to add additional WeChat accounts.
-
 ## Chat Commands
 
-Send these commands as WeChat messages:
+Send these as WeChat messages:
 
-### Talk to an agent
-
-```
-hello                     # sends to the default agent
-/codex write a function   # sends to codex
-/cc explain this code     # sends to claude (alias)
-```
-
-### Switch default agent
-
-```
-/claude       # switch default to claude
-/codex        # switch default to codex
-/gemini       # switch default to gemini
-```
-
-The switch is persisted to config — survives restarts.
-
-### Status
-
-```
-/status       # show current agent, type, and model
-```
+| Command | Description |
+|---------|-------------|
+| `hello` | Send to default agent |
+| `/codex write a function` | Send to a specific agent |
+| `/cc explain this code` | Send to agent by alias |
+| `/claude` | Switch default agent to Claude |
+| `/status` | Show current agent info |
 
 ### Aliases
 
@@ -90,6 +92,8 @@ The switch is persisted to config — survives restarts.
 | `/gm` | gemini |
 | `/ocd` | opencode |
 | `/oc` | openclaw |
+
+Switching default agent is persisted to config — survives restarts.
 
 ## Configuration
 
@@ -146,6 +150,16 @@ docker logs -f weclaw
 > Note: ACP and CLI agents require the agent binary inside the container.
 > The Docker image ships only WeClaw itself. For ACP/CLI agents, mount
 > the binary or build a custom image. HTTP agents work out of the box.
+
+## Release
+
+```bash
+# Tag a new version to trigger GitHub Actions build & release
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow builds binaries for `darwin/linux` x `amd64/arm64`, creates a GitHub Release, and uploads all artifacts with checksums.
 
 ## Development
 

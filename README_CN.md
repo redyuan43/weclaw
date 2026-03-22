@@ -4,7 +4,37 @@
 
 微信 AI Agent 桥接器 — 通过 [iLink](https://www.ilink.wiki) API 将微信消息接入 AI 编程助手（Claude、Codex、Gemini、Kimi 等）。
 
-![预览](preview.png)
+| | | |
+|:---:|:---:|:---:|
+| <img src="previews/preview1.png" width="280" /> | <img src="previews/preview2.png" width="280" /> | <img src="previews/preview3.png" width="280" /> |
+
+## 快速开始
+
+```bash
+# 一键安装
+curl -sSL https://raw.githubusercontent.com/fastclaw-ai/weclaw/main/install.sh | sh
+
+# 启动（首次运行会弹出微信扫码登录）
+weclaw start
+```
+
+就这么简单。首次启动时，WeClaw 会：
+1. 显示二维码 — 用微信扫码登录
+2. 自动检测已安装的 AI Agent（Claude、Codex、Gemini 等）
+3. 保存配置到 `~/.weclaw/config.json`
+4. 开始接收和回复微信消息
+
+使用 `weclaw login` 可以添加更多微信账号。
+
+### 其他安装方式
+
+```bash
+# 通过 Go 安装
+go install github.com/fastclaw-ai/weclaw@latest
+
+# 通过 Docker
+docker run -it -v ~/.weclaw:/root/.weclaw ghcr.io/fastclaw-ai/weclaw start
+```
 
 ## 架构
 
@@ -39,45 +69,17 @@ iLink API (长轮询)
 
 同时存在 ACP 和 CLI 时，自动优先选择 ACP。
 
-## 快速开始
-
-```bash
-# 安装
-go install github.com/fastclaw-ai/weclaw@latest
-
-# 启动（首次运行会弹出微信扫码登录）
-weclaw start
-```
-
-首次启动时，WeClaw 会弹出二维码进行微信登录，然后自动检测已安装的 Agent，将配置保存到 `~/.weclaw/config.json`。使用 `weclaw login` 可以添加更多微信账号。
-
 ## 聊天命令
 
 在微信中发送以下命令：
 
-### 对话
-
-```
-你好                       # 发送给默认 Agent
-/codex 写一个排序函数       # 发送给 Codex
-/cc 解释一下这段代码        # 发送给 Claude（别名）
-```
-
-### 切换默认 Agent
-
-```
-/claude       # 切换到 Claude
-/codex        # 切换到 Codex
-/gemini       # 切换到 Gemini
-```
-
-切换会写入配置文件，重启后仍然生效。
-
-### 查看状态
-
-```
-/status       # 显示当前 Agent、类型和模型
-```
+| 命令 | 说明 |
+|------|------|
+| `你好` | 发送给默认 Agent |
+| `/codex 写一个排序函数` | 发送给指定 Agent |
+| `/cc 解释一下这段代码` | 通过别名发送 |
+| `/claude` | 切换默认 Agent 为 Claude |
+| `/status` | 查看当前 Agent 信息 |
 
 ### 快捷别名
 
@@ -90,6 +92,8 @@ weclaw start
 | `/gm` | Gemini |
 | `/ocd` | OpenCode |
 | `/oc` | OpenClaw |
+
+切换默认 Agent 会写入配置文件，重启后仍然生效。
 
 ## 配置
 
@@ -146,6 +150,16 @@ docker logs -f weclaw
 > 注意：ACP 和 CLI 模式需要容器内有对应的 Agent 二进制文件。
 > 默认镜像只包含 WeClaw 本体。如需使用 ACP/CLI Agent，请挂载二进制文件或构建自定义镜像。
 > HTTP 模式开箱即用。
+
+## 发版
+
+```bash
+# 打 tag 触发 GitHub Actions 自动构建发版
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+自动构建 `darwin/linux` x `amd64/arm64` 四个平台的二进制，创建 GitHub Release 并上传所有产物和校验文件。
 
 ## 开发
 
