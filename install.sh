@@ -43,10 +43,11 @@ curl -fsSL -o "$TMP" "$URL"
 
 # Install
 chmod +x "$TMP"
-if [ -w "$INSTALL_DIR" ]; then
+if [ -d "$INSTALL_DIR" ] && [ -w "$INSTALL_DIR" ]; then
   mv "$TMP" "${INSTALL_DIR}/${BINARY}"
 else
   echo "Installing to ${INSTALL_DIR} (requires sudo)..."
+  sudo mkdir -p "$INSTALL_DIR"
   sudo mv "$TMP" "${INSTALL_DIR}/${BINARY}"
 fi
 
