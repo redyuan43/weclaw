@@ -171,9 +171,8 @@ type codexTurnEvent struct {
 
 func detectACPProtocol(command string, args []string) string {
 	base := strings.ToLower(filepath.Base(command))
-	if base == "codex-acp" || strings.HasPrefix(base, "codex-acp.") {
-		return protocolCodexAppServer
-	}
+	// codex-acp is a standard ACP wrapper, NOT codex app-server
+	// Only `codex app-server` uses the codex-native protocol
 	if base == "codex" || base == "codex.exe" {
 		for _, arg := range args {
 			if arg == "app-server" {
