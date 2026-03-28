@@ -161,6 +161,12 @@ var agentAliases = map[string]string{
 	"km":  "kimi",
 	"gm":  "gemini",
 	"ocd": "opencode",
+	"pi":  "pi",
+	"cp":  "copilot",
+	"dr":  "droid",
+	"if":  "iflow",
+	"kr":  "kiro",
+	"qw":  "qwen",
 }
 
 // resolveAlias returns the full agent name for an alias, or the original name if no alias matches.
@@ -630,7 +636,7 @@ func buildHelpText() string {
 /info - Show current agent info
 /help - Show this help message
 
-Aliases: /cc(claude) /cx(codex) /cs(cursor) /km(kimi) /gm(gemini) /oc(openclaw) /ocd(opencode)`
+Aliases: /cc(claude) /cx(codex) /cs(cursor) /km(kimi) /gm(gemini) /oc(openclaw) /ocd(opencode) /pi(pi) /cp(copilot) /dr(droid) /if(iflow) /kr(kiro) /qw(qwen)`
 }
 
 func extractText(msg ilink.WeixinMessage) string {
