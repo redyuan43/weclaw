@@ -21,3 +21,8 @@ Thumbs.db
 
 # Claude Code
 .claude/
+.codex
+.omx/
+
+# Local regression artifacts
+test-artifacts/
