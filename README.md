@@ -4,6 +4,8 @@
 
 WeChat AI Agent Bridge — connect WeChat to AI agents (Claude, Codex, Gemini, Kimi, etc.).
 
+Setup and run guide: [SETUP_RUN_GUIDE_CN.md](SETUP_RUN_GUIDE_CN.md)
+
 > This project is inspired by [@tencent-weixin/openclaw-weixin](https://npmx.dev/package/@tencent-weixin/openclaw-weixin). For personal learning only, not for commercial use.
 
 | | | |

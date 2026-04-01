@@ -4,6 +4,8 @@
 
 微信 AI Agent 桥接器 — 将微信消息接入 AI Agent（Claude、Codex、Gemini、Kimi 等）。
 
+运行与部署说明见：[安装与运行指南](SETUP_RUN_GUIDE_CN.md)
+
 > 本项目参考 [@tencent-weixin/openclaw-weixin](https://npmx.dev/package/@tencent-weixin/openclaw-weixin) 实现，仅限个人学习，勿做他用。
 
 |                                                 |                                                 |                                                 |
