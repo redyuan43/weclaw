@@ -39,9 +39,10 @@ type Handler struct {
 	customAliases map[string]string      // custom alias -> agent name (from config)
 	factory       AgentFactory
 	saveDefault   SaveDefaultFunc
-	contextTokens sync.Map   // map[userID]contextToken
-	saveDir       string     // directory to save images/files to
-	seenMsgs      sync.Map   // map[int64]time.Time — dedup by message_id
+	mediaService  *MediaServiceClient
+	contextTokens sync.Map // map[userID]contextToken
+	saveDir       string   // directory to save images/files to
+	seenMsgs      sync.Map // map[int64]time.Time — dedup by message_id
 }
 
 // NewHandler creates a new message handler.
@@ -285,6 +286,18 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 			log.Printf("[handler] voice transcription from %s: %q", msg.FromUserID, truncate(text, 80))
 		}
 	}
+	if h.mediaService != nil {
+		incomingMedia, hasMedia, err := h.collectIncomingRichMedia(ctx, msg)
+		if err != nil {
+			log.Printf("[handler] failed to collect incoming rich media from %s: %v", msg.FromUserID, err)
+		} else if hasMedia {
+			if incomingMedia.userText == "" {
+				incomingMedia.userText = text
+			}
+			h.handleRichMediaMessage(ctx, client, msg, incomingMedia)
+			return
+		}
+	}
 	if text == "" {
 		// Check for image message
 		if img := extractImage(msg); img != nil && h.saveDir != "" {
@@ -493,8 +506,12 @@ func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, 
 	imageURLs := ExtractImageURLs(reply)
 	attachmentPaths := extractLocalAttachmentPaths(reply)
 	allowedRoots := h.allowedAttachmentRoots(agentName)
+	textReply := rewriteReplyWithAttachmentResults(reply, attachmentPaths, nil)
 
-	var sentPaths []string
+	if err := SendTextReply(ctx, client, msg.FromUserID, textReply, msg.ContextToken, clientID); err != nil {
+		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+	}
+
 	var failedPaths []string
 	for _, attachmentPath := range attachmentPaths {
 		if !isAllowedAttachmentPath(attachmentPath, allowedRoots) {
@@ -507,13 +524,12 @@ func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, 
 			failedPaths = append(failedPaths, attachmentPath)
 			continue
 		}
-		sentPaths = append(sentPaths, attachmentPath)
 	}
-
-	reply = rewriteReplyWithAttachmentResults(reply, sentPaths, failedPaths)
-
-	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+	if len(failedPaths) > 0 {
+		failureReply := rewriteReplyWithAttachmentResults("", nil, failedPaths)
+		if err := SendTextReply(ctx, client, msg.FromUserID, failureReply, msg.ContextToken, NewClientID()); err != nil {
+			log.Printf("[handler] failed to send attachment failure reply to %s: %v", msg.FromUserID, err)
+		}
 	}
 
 	for _, imgURL := range imageURLs {

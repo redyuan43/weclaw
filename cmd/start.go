@@ -128,6 +128,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 	handler.SetAgentMetas(metas)
 	handler.SetAgentWorkDirs(workDirs)
+	if cfg.MediaServiceURL != "" {
+		handler.SetMediaService(messaging.NewMediaServiceClient(cfg.MediaServiceURL))
+		log.Printf("Media service enabled: %s", cfg.MediaServiceURL)
+	}
 
 	// Load custom aliases from agent configs
 	handler.SetCustomAliases(config.BuildAliasMap(cfg.Agents))
