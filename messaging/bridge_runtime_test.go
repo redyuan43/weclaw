@@ -159,6 +159,12 @@ func TestBridgeRuntimeHeuristicRoutesPeerUserAlias(t *testing.T) {
 	if recorder.dispatches[0].TaskType != "peer_user_question" {
 		t.Fatalf("taskType = %q, want peer_user_question", recorder.dispatches[0].TaskType)
 	}
+	if recorder.dispatches[0].Payload["question_text"] != "帮我问一下 NX1 晚饭吃什么，告诉我结果" {
+		t.Fatalf("question_text = %#v, want structured question_text", recorder.dispatches[0].Payload["question_text"])
+	}
+	if recorder.dispatches[0].Payload["requester_agent_label"] != "MTM" {
+		t.Fatalf("requester_agent_label = %#v, want MTM", recorder.dispatches[0].Payload["requester_agent_label"])
+	}
 }
 
 func TestBridgeRuntimeDeliverToPeerUserNormalizesToLocalReply(t *testing.T) {
@@ -342,6 +348,41 @@ func TestBridgeRuntimeAssistAndReturnRoundTrip(t *testing.T) {
 	}
 	if task.Status != BridgeTaskCompleted {
 		t.Fatalf("local task status = %s, want %s", task.Status, BridgeTaskCompleted)
+	}
+}
+
+func TestBridgeRuntimePeerUserQuestionIsRewrittenByPeerAgent(t *testing.T) {
+	recorder := &testBridgeRecorder{
+		chatReply: `{"action":"need_more_info_from_local_user","message":"主人，MTM 那边想问你：今天晚上的作业做完了吗？","target_node":null,"rationale":"peer-user-proxy rewrite","follow_up_needed":true}`,
+	}
+	runtime := newTestBridgeRuntime(recorder)
+
+	result, err := runtime.ReceiveRequest(context.Background(), TaskRequest{
+		Envelope: newEnvelope("conv-proxy-1", "remote-node", "local-node", "remote-user@im.wechat", "task-remote", "task-local"),
+		TaskType: "peer_user_question",
+		Payload: map[string]any{
+			"text":                  "问一下NX1，今天晚上的作业你有做完吗？",
+			"question_text":         "今天晚上的作业你做完了吗？",
+			"requester_agent_label": "MTM",
+			"requester_user_id":     "user-a@im.wechat",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReceiveRequest returned error: %v", err)
+	}
+	if !result.Accepted || result.Route != "clarify" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+
+	waitForCondition(t, func() bool { return len(recorder.sendCalls) == 1 })
+	if got := recorder.sendCalls[0].text; got != "主人，MTM 那边想问你：今天晚上的作业做完了吗？" {
+		t.Fatalf("rewritten question = %q, want B-side rewritten voice", got)
+	}
+	if strings.Contains(recorder.sendCalls[0].text, "问一下NX1") {
+		t.Fatalf("question still contains raw forwarded wording: %q", recorder.sendCalls[0].text)
+	}
+	if recorder.chatCalls != 1 {
+		t.Fatalf("chatCalls = %d, want 1", recorder.chatCalls)
 	}
 }
 

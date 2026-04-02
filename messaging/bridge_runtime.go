@@ -120,6 +120,11 @@ type BridgeTask struct {
 	UpdatedAt       string               `json:"updated_at"`
 }
 
+const (
+	waitingScopeLocalUserFollowUp = "local_user_follow_up"
+	waitingScopePeerUserProxy     = "peer_user_proxy"
+)
+
 type BridgeRuntimeDeps struct {
 	Chat     func(ctx context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error)
 	SendText func(ctx context.Context, accountID, toUserID, text, contextToken string) error
@@ -306,9 +311,12 @@ func (r *BridgeRuntime) ReceiveRequest(ctx context.Context, request TaskRequest)
 		}, nil
 
 	case "peer_user_question":
-		text := strings.TrimSpace(stringValue(request.Payload["text"]))
-		if text == "" {
-			return &TaskResult{TaskID: request.Envelope.MessageID, Status: string(BridgeTaskFailed), Accepted: false, Detail: "missing text"}, nil
+		questionText := strings.TrimSpace(stringValue(request.Payload["question_text"]))
+		if questionText == "" {
+			questionText = strings.TrimSpace(stringValue(request.Payload["text"]))
+		}
+		if questionText == "" {
+			return &TaskResult{TaskID: request.Envelope.MessageID, Status: string(BridgeTaskFailed), Accepted: false, Detail: "missing question_text"}, nil
 		}
 		task := newPeerBridgeTask(
 			r.cfg.NodeID,
@@ -318,22 +326,19 @@ func (r *BridgeRuntime) ReceiveRequest(ctx context.Context, request TaskRequest)
 			r.cfg.LocalUserID,
 			r.cfg.LocalUserID,
 			request.Envelope.ConversationID,
-			text,
+			questionText,
 		)
 		task.PeerNodeID = request.Envelope.SourceNode
 		task.Metadata["delivery_mode"] = string(DeliveryModeAssistAndReturn)
-		task.Metadata["waiting_scope"] = "peer_user_proxy"
+		task.Metadata["waiting_scope"] = waitingScopePeerUserProxy
 		task.Metadata["context_token"] = ""
-		task.appendHistory("peer_agent", text)
-		if err := r.sendText(ctx, "", task.ReplyUserID, text, ""); err != nil {
-			r.logf(task, "failed sending peer_user_question to local user=%s: %v", task.ReplyUserID, err)
-			task.fail(err.Error())
-			r.store.Save(task)
-			return &TaskResult{TaskID: task.TaskID, Status: string(task.Status), Accepted: false, Detail: err.Error()}, nil
-		}
-		task.setStatus(BridgeTaskWaitingLocalUser, "peer_user_question")
+		task.Metadata["proxy_question_text"] = questionText
+		task.Metadata["requester_agent_label"] = firstNonBlank(stringValue(request.Payload["requester_agent_label"]), request.Envelope.SourceNode)
+		task.Metadata["requester_user_id"] = firstNonBlank(stringValue(request.Payload["requester_user_id"]), request.Envelope.SourceUser)
+		task.appendHistory("peer_agent", questionText)
 		r.store.Save(task)
-		r.logf(task, "delivered peer_user_question to local user=%s", task.ReplyUserID)
+		r.logf(task, "created proxy question requester_agent_label=%s question=%q", task.Metadata["requester_agent_label"], truncate(questionText, 120))
+		r.processTaskAsync(task)
 		return &TaskResult{
 			TaskID:   task.TaskID,
 			Status:   string(task.Status),
@@ -520,6 +525,19 @@ func (r *BridgeRuntime) normalizeDecision(task *BridgeTask, decision BridgeDecis
 		return decision
 	}
 
+	if task.Metadata["waiting_scope"] == waitingScopePeerUserProxy {
+		if decision.Action != "need_more_info_from_local_user" {
+			return BridgeDecision{
+				Action:         "need_more_info_from_local_user",
+				Message:        decision.Message,
+				Rationale:      firstNonBlank(decision.Rationale, "normalized peer-user proxy question"),
+				FollowUpNeeded: true,
+			}
+		}
+		decision.FollowUpNeeded = true
+		return decision
+	}
+
 	if r.deliveryModeForTask(task) == DeliveryModeDeliverToPeerUser {
 		if decision.Action != "reply_local_user" && decision.Action != "need_more_info_from_local_user" {
 			return BridgeDecision{
@@ -563,7 +581,9 @@ func (r *BridgeRuntime) applyDecision(ctx context.Context, task *BridgeTask, dec
 		if err := r.sendText(ctx, task.Metadata["account_id"], task.ReplyUserID, decision.Message, task.Metadata["context_token"]); err != nil {
 			return "", err
 		}
-		task.Metadata["waiting_scope"] = "local_user_follow_up"
+		if task.Metadata["waiting_scope"] != waitingScopePeerUserProxy {
+			task.Metadata["waiting_scope"] = waitingScopeLocalUserFollowUp
+		}
 		task.setStatus(BridgeTaskWaitingLocalUser, "need_more_info_from_local_user")
 		r.store.Save(task)
 		r.logf(task, "waiting for local user follow-up")
@@ -578,7 +598,10 @@ func (r *BridgeRuntime) applyDecision(ctx context.Context, task *BridgeTask, dec
 			Envelope: newEnvelope(task.ConversationID, r.cfg.NodeID, targetNode, task.ReplyUserID, task.TaskID, task.TaskID),
 			TaskType: "peer_user_question",
 			Payload: map[string]any{
-				"text": decision.Message,
+				"text":                  decision.Message,
+				"question_text":         decision.Message,
+				"requester_agent_label": firstNonBlank(firstAlias(r.cfg.LocalAgentAliases), r.cfg.NodeID),
+				"requester_user_id":     task.ReplyUserID,
 			},
 		}
 		r.logf(task, "dispatching peer_user_question to node=%s text=%q", targetNode, truncate(decision.Message, 120))
@@ -680,7 +703,7 @@ func (r *BridgeRuntime) resumeFromLocalUser(ctx context.Context, task *BridgeTas
 	task.appendHistory("local_user", content)
 	r.logf(task, "received local user follow-up scope=%s text=%q", task.Metadata["waiting_scope"], truncate(content, 120))
 
-	if task.Metadata["waiting_scope"] == "peer_user_proxy" {
+	if task.Metadata["waiting_scope"] == waitingScopePeerUserProxy {
 		request := TaskRequest{
 			Envelope: newEnvelope(task.ConversationID, r.cfg.NodeID, task.RequesterNodeID, task.ReplyUserID, task.TaskID, task.ParentTaskID),
 			TaskType: "peer_user_answer",
@@ -826,6 +849,9 @@ func (r *BridgeRuntime) buildDecisionPrompt(task *BridgeTask, targetNode string)
 		"- If origin_kind=peer_agent and metadata.delivery_mode=deliver_to_peer_user, prefer reply_local_user unless clarification is required.\n" +
 		"- If origin_kind=peer_agent and metadata.delivery_mode=assist_and_return, prefer sending the answer back to requester_node_id.\n" +
 		"- peer_agent_aliases are names for the remote assistant. peer_user_aliases are names for the remote human user. Do not confuse them.\n" +
+		"- If metadata.waiting_scope=peer_user_proxy, you are not answering yet. Rewrite the question into this node's own assistant voice and use need_more_info_from_local_user.\n" +
+		"- For peer_user_proxy, treat metadata.proxy_question_text as the source question and metadata.requester_agent_label as the remote assistant label.\n" +
+		"- For peer_user_proxy, do not mechanically repeat the original wording. Ask the local human naturally, as if you are speaking to your own owner.\n" +
 		"- Treat shortened or fuzzy references to configured aliases as valid mentions.\n" +
 		"- Keep message concise and directly usable.\n" +
 		"- If unsure, choose need_more_info_from_local_user.\n" +
@@ -1009,6 +1035,15 @@ func containsBridgeKeyword(text string, keywords ...string) bool {
 
 func wantsReplyBack(text string) bool {
 	return containsBridgeKeyword(text, "回复后再转告我", "再转告我", "告诉我结果", "告诉我", "回我", "reply back", "tell me the result", "let me know")
+}
+
+func firstAlias(values []string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func newEnvelope(conversationID, sourceNode, targetNode, sourceUser, sourceTaskID, replyToTaskID string) Envelope {
