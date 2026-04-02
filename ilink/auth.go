@@ -10,12 +10,12 @@ import (
 )
 
 const (
-	qrCodeURL     = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3"
-	qrStatusURL   = "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode="
-	statusWait     = "wait"
-	statusScanned  = "scaned"
+	qrCodeURL       = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3"
+	qrStatusURL     = "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode="
+	statusWait      = "wait"
+	statusScanned   = "scaned"
 	statusConfirmed = "confirmed"
-	statusExpired  = "expired"
+	statusExpired   = "expired"
 )
 
 // FetchQRCode retrieves a new QR code for login.
@@ -79,6 +79,9 @@ func PollQRStatus(ctx context.Context, qrcode string, onStatus func(status strin
 
 // AccountsDir returns the directory where account credentials are stored.
 func AccountsDir() (string, error) {
+	if custom := os.Getenv("WECLAW_ACCOUNTS_DIR"); custom != "" {
+		return custom, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err

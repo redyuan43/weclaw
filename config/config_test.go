@@ -122,12 +122,18 @@ func TestBridgeConfigRoundTrip(t *testing.T) {
 	cfg := Config{
 		Agents: map[string]AgentConfig{},
 		Bridge: BridgeConfig{
-			Enabled:         true,
-			Endpoint:        "http://127.0.0.1:8781/im/weclaw/inbound",
-			Fallback:        "local_agent",
-			ChatAllowlist:   []string{"user@im.wechat"},
-			IgnorePrefixes:  []string{"[A2A-BRIDGE] "},
-			RequestTimeoutS: 9,
+			Enabled:           true,
+			NodeID:            "local-node",
+			ListenAddr:        "127.0.0.1:18012",
+			PublicBaseURL:     "http://192.168.31.10:18012",
+			PeerNodeID:        "remote-node",
+			PeerBaseURL:       "http://192.168.31.40:18012",
+			LocalUserID:       "local-user@im.wechat",
+			LocalAgentAliases: []string{"MTM", "蜜桃喵"},
+			PeerAgentAliases:  []string{"幽浮喵", "UFO"},
+			PeerUserAliases:   []string{"NX1", "Ivan_NX1"},
+			OutboundPrefix:    "[A2A-BRIDGE] ",
+			RequestTimeoutS:   9,
 		},
 	}
 
@@ -141,7 +147,7 @@ func TestBridgeConfigRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal bridge config: %v", err)
 	}
 
-	if !decoded.Bridge.Enabled || decoded.Bridge.Endpoint == "" || decoded.Bridge.RequestTimeoutS != 9 {
+	if !decoded.Bridge.Enabled || decoded.Bridge.PeerBaseURL == "" || decoded.Bridge.RequestTimeoutS != 9 {
 		t.Fatalf("decoded bridge = %#v", decoded.Bridge)
 	}
 }

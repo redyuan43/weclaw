@@ -1,11 +1,40 @@
 package messaging
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/fastclaw-ai/weclaw/agent"
 )
+
+type fakeAgent struct {
+	info           agent.AgentInfo
+	lastConvID     string
+	lastMessage    string
+	reply          string
+	err            error
+	resetSessionID string
+}
+
+func (f *fakeAgent) Chat(_ context.Context, conversationID string, message string) (string, error) {
+	f.lastConvID = conversationID
+	f.lastMessage = message
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.reply, nil
+}
+
+func (f *fakeAgent) ResetSession(_ context.Context, _ string) (string, error) {
+	return f.resetSessionID, nil
+}
+
+func (f *fakeAgent) Info() agent.AgentInfo {
+	return f.info
+}
+
+func (f *fakeAgent) SetCwd(_ string) {}
 
 func newTestHandler() *Handler {
 	return &Handler{agents: make(map[string]agent.Agent)}
@@ -136,5 +165,61 @@ func TestBuildHelpText(t *testing.T) {
 	}
 	if !strings.Contains(text, "/help") {
 		t.Error("help text should mention /help")
+	}
+}
+
+func TestChatLocalAgent_UsesConfiguredDefaultAgent(t *testing.T) {
+	ag := &fakeAgent{
+		info:  agent.AgentInfo{Name: "codex", Type: "acp", Model: "gpt-5.1-codex-mini"},
+		reply: "done",
+	}
+	h := NewHandler(func(_ context.Context, name string) agent.Agent {
+		if name == "codex" {
+			return ag
+		}
+		return nil
+	}, nil)
+	h.SetDefaultAgentName("codex")
+
+	result, err := h.ChatLocalAgent(context.Background(), "a2a:conv-1", "hello", "")
+	if err != nil {
+		t.Fatalf("ChatLocalAgent returned error: %v", err)
+	}
+	if result.AgentName != "codex" {
+		t.Fatalf("AgentName = %q, want codex", result.AgentName)
+	}
+	if result.Reply != "done" {
+		t.Fatalf("Reply = %q, want done", result.Reply)
+	}
+	if ag.lastConvID != "a2a:conv-1" {
+		t.Fatalf("conversationID = %q, want a2a:conv-1", ag.lastConvID)
+	}
+	if ag.lastMessage != "hello" {
+		t.Fatalf("message = %q, want hello", ag.lastMessage)
+	}
+}
+
+func TestChatLocalAgent_UsesExplicitAgentName(t *testing.T) {
+	ag := &fakeAgent{
+		info:  agent.AgentInfo{Name: "codex54", Type: "acp", Model: "gpt-5.4"},
+		reply: "routed",
+	}
+	h := NewHandler(func(_ context.Context, name string) agent.Agent {
+		if name == "codex54" {
+			return ag
+		}
+		return nil
+	}, nil)
+	h.SetDefaultAgentName("codex")
+
+	result, err := h.ChatLocalAgent(context.Background(), "a2a:conv-2", "route this", "codex54")
+	if err != nil {
+		t.Fatalf("ChatLocalAgent returned error: %v", err)
+	}
+	if result.AgentName != "codex54" {
+		t.Fatalf("AgentName = %q, want codex54", result.AgentName)
+	}
+	if ag.lastConvID != "a2a:conv-2" {
+		t.Fatalf("conversationID = %q, want a2a:conv-2", ag.lastConvID)
 	}
 }

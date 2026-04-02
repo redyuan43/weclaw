@@ -33,12 +33,12 @@ type Monitor struct {
 
 // NewMonitor creates a new long-poll monitor.
 func NewMonitor(client *Client, handler MessageHandler) (*Monitor, error) {
-	home, err := os.UserHomeDir()
+	accountsDir, err := AccountsDir()
 	if err != nil {
 		return nil, err
 	}
 	accountID := NormalizeAccountID(client.BotID())
-	bufPath := filepath.Join(home, ".weclaw", "accounts", accountID+".sync.json")
+	bufPath := filepath.Join(accountsDir, accountID+".sync.json")
 
 	m := &Monitor{
 		client:       client,

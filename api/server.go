@@ -18,10 +18,11 @@ type Server struct {
 	defaultClient *ilink.Client
 	addr          string
 	inbox         *messaging.InboxStore
+	handler       *messaging.Handler
 }
 
 // NewServer creates an API server.
-func NewServer(clients []*ilink.Client, addr string, inbox *messaging.InboxStore) *Server {
+func NewServer(clients []*ilink.Client, addr string, inbox *messaging.InboxStore, handler *messaging.Handler) *Server {
 	if addr == "" {
 		addr = "127.0.0.1:18011"
 	}
@@ -36,7 +37,7 @@ func NewServer(clients []*ilink.Client, addr string, inbox *messaging.InboxStore
 		}
 		mapped[client.BotID()] = client
 	}
-	return &Server{clients: mapped, defaultClient: defaultClient, addr: addr, inbox: inbox}
+	return &Server{clients: mapped, defaultClient: defaultClient, addr: addr, inbox: inbox, handler: handler}
 }
 
 // SendRequest is the JSON body for POST /api/send.
@@ -47,10 +48,18 @@ type SendRequest struct {
 	MediaURL  string `json:"media_url,omitempty"`
 }
 
+type AgentChatRequest struct {
+	ConversationID string `json:"conversation_id"`
+	Message        string `json:"message"`
+	AgentName      string `json:"agent_name,omitempty"`
+}
+
 // Run starts the HTTP server. Blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/send", s.handleSend)
+	mux.HandleFunc("/api/agent/chat", s.handleAgentChat)
+	mux.HandleFunc("/api/bridge/inbound", s.handleBridgeInbound)
 	mux.HandleFunc("/api/inbox", s.handleInbox)
 	mux.HandleFunc("/api/inbox/clear", s.handleClearInbox)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -125,6 +134,81 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleAgentChat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.handler == nil {
+		http.Error(w, "agent handler unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req AgentChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ConversationID == "" {
+		http.Error(w, `"conversation_id" is required`, http.StatusBadRequest)
+		return
+	}
+	if req.Message == "" {
+		http.Error(w, `"message" is required`, http.StatusBadRequest)
+		return
+	}
+
+	result, err := s.handler.ChatLocalAgent(r.Context(), req.ConversationID, req.Message, req.AgentName)
+	if err != nil {
+		http.Error(w, "agent chat failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(
+		map[string]any{
+			"reply": result.Reply,
+			"agent": map[string]any{
+				"name":    result.AgentName,
+				"type":    result.Info.Type,
+				"model":   result.Info.Model,
+				"command": result.Info.Command,
+				"pid":     result.Info.PID,
+			},
+		},
+	)
+}
+
+func (s *Server) handleBridgeInbound(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.handler == nil {
+		http.Error(w, "bridge handler unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req messaging.TaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	result, err := s.handler.HandleBridgeRequest(r.Context(), req)
+	if err != nil {
+		result = &messaging.TaskResult{
+			TaskID:   req.Envelope.MessageID,
+			Status:   "failed",
+			Accepted: false,
+			Detail:   err.Error(),
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {

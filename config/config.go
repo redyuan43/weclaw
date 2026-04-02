@@ -20,12 +20,18 @@ type Config struct {
 
 // BridgeConfig controls optional A2A bridge forwarding for selected chats.
 type BridgeConfig struct {
-	Enabled         bool     `json:"enabled,omitempty"`
-	Endpoint        string   `json:"endpoint,omitempty"`
-	Fallback        string   `json:"fallback,omitempty"`
-	ChatAllowlist   []string `json:"chat_allowlist,omitempty"`
-	IgnorePrefixes  []string `json:"ignore_prefixes,omitempty"`
-	RequestTimeoutS int      `json:"request_timeout_seconds,omitempty"`
+	Enabled           bool     `json:"enabled,omitempty"`
+	NodeID            string   `json:"node_id,omitempty"`
+	ListenAddr        string   `json:"listen_addr,omitempty"`
+	PublicBaseURL     string   `json:"public_base_url,omitempty"`
+	PeerNodeID        string   `json:"peer_node_id,omitempty"`
+	PeerBaseURL       string   `json:"peer_base_url,omitempty"`
+	LocalUserID       string   `json:"local_user_id,omitempty"`
+	LocalAgentAliases []string `json:"local_agent_aliases,omitempty"`
+	PeerAgentAliases  []string `json:"peer_agent_aliases,omitempty"`
+	PeerUserAliases   []string `json:"peer_user_aliases,omitempty"`
+	OutboundPrefix    string   `json:"outbound_prefix,omitempty"`
+	RequestTimeoutS   int      `json:"request_timeout_seconds,omitempty"`
 }
 
 // AgentConfig holds configuration for a single agent.
@@ -77,12 +83,15 @@ func BuildAliasMap(agents map[string]AgentConfig) map[string]string {
 func DefaultConfig() *Config {
 	return &Config{
 		Agents: make(map[string]AgentConfig),
-		Bridge: BridgeConfig{Fallback: "local_agent", RequestTimeoutS: 10},
+		Bridge: BridgeConfig{RequestTimeoutS: 10},
 	}
 }
 
 // ConfigPath returns the path to the config file.
 func ConfigPath() (string, error) {
+	if custom := os.Getenv("WECLAW_CONFIG_PATH"); custom != "" {
+		return custom, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -113,9 +122,6 @@ func Load() (*Config, error) {
 	}
 	if cfg.Agents == nil {
 		cfg.Agents = make(map[string]AgentConfig)
-	}
-	if cfg.Bridge.Fallback == "" {
-		cfg.Bridge.Fallback = "local_agent"
 	}
 	if cfg.Bridge.RequestTimeoutS == 0 {
 		cfg.Bridge.RequestTimeoutS = 10

@@ -73,7 +73,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		accounts = append(accounts, creds)
 	}
 
-	// Load config and auto-detect agents
+	// Load config and optionally auto-detect agents
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
@@ -100,6 +100,18 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Create local inbox store for bridge/test automation.
 	inboxStore := messaging.NewInboxStore(500)
 
+	var clients []*ilink.Client
+	clientByID := make(map[string]*ilink.Client, len(accounts))
+	var defaultClient *ilink.Client
+	for _, creds := range accounts {
+		client := ilink.NewClient(creds)
+		clients = append(clients, client)
+		clientByID[client.BotID()] = client
+		if defaultClient == nil {
+			defaultClient = client
+		}
+	}
+
 	// Create handler with an agent factory for on-demand agent creation
 	handler := messaging.NewHandler(
 		func(ctx context.Context, name string) agent.Agent {
@@ -110,6 +122,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 			return config.Save(cfg)
 		},
 	)
+	handler.SetDefaultAgentName(cfg.DefaultAgent)
 
 	// Populate agent metas for /status
 	var metas []messaging.AgentMeta
@@ -139,20 +152,34 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Load custom aliases from agent configs
 	handler.SetCustomAliases(config.BuildAliasMap(cfg.Agents))
 	handler.SetInboxStore(inboxStore)
-	if cfg.Bridge.Enabled && cfg.Bridge.Endpoint != "" {
-		allow := make(map[string]struct{}, len(cfg.Bridge.ChatAllowlist))
-		for _, chatID := range cfg.Bridge.ChatAllowlist {
-			allow[chatID] = struct{}{}
-		}
-		handler.SetBridge(messaging.NewBridgeClient(messaging.BridgeConfig{
-			Enabled:        true,
-			Endpoint:       cfg.Bridge.Endpoint,
-			Fallback:       cfg.Bridge.Fallback,
-			ChatAllowlist:  allow,
-			IgnorePrefixes: cfg.Bridge.IgnorePrefixes,
-			Timeout:        time.Duration(cfg.Bridge.RequestTimeoutS) * time.Second,
-		}))
-		log.Printf("[bridge] enabled for %d chat(s) -> %s", len(allow), cfg.Bridge.Endpoint)
+	if cfg.Bridge.Enabled {
+		handler.SetBridge(messaging.NewBridgeRuntime(
+			messaging.BridgeConfig{
+				Enabled:           true,
+				NodeID:            cfg.Bridge.NodeID,
+				ListenAddr:        cfg.Bridge.ListenAddr,
+				PublicBaseURL:     cfg.Bridge.PublicBaseURL,
+				PeerNodeID:        cfg.Bridge.PeerNodeID,
+				PeerBaseURL:       cfg.Bridge.PeerBaseURL,
+				LocalUserID:       cfg.Bridge.LocalUserID,
+				LocalAgentAliases: cfg.Bridge.LocalAgentAliases,
+				PeerAgentAliases:  cfg.Bridge.PeerAgentAliases,
+				PeerUserAliases:   cfg.Bridge.PeerUserAliases,
+				OutboundPrefix:    cfg.Bridge.OutboundPrefix,
+				Timeout:           time.Duration(cfg.Bridge.RequestTimeoutS) * time.Second,
+			},
+			messaging.BridgeRuntimeDeps{
+				Chat: handler.ChatLocalAgent,
+				SendText: func(ctx context.Context, accountID, toUserID, text, contextToken string) error {
+					client, err := selectLocalClient(clientByID, defaultClient, accountID)
+					if err != nil {
+						return err
+					}
+					return messaging.SendTextReply(ctx, client, toUserID, text, contextToken, "")
+				},
+			},
+		))
+		log.Printf("[bridge] enabled node=%s peer=%s public=%s", cfg.Bridge.NodeID, cfg.Bridge.PeerNodeID, cfg.Bridge.PublicBaseURL)
 	}
 
 	// Set save directory for images/files if configured
@@ -176,17 +203,15 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Start HTTP API server for sending messages
-	var clients []*ilink.Client
-	for _, c := range accounts {
-		clients = append(clients, ilink.NewClient(c))
+	// Resolve API addr: flag > bridge.listen_addr > api_addr > default
+	apiAddr := cfg.APIAddr
+	if cfg.Bridge.Enabled && cfg.Bridge.ListenAddr != "" {
+		apiAddr = cfg.Bridge.ListenAddr
 	}
-	// Resolve API addr: flag > env/config > default
-	apiAddr := cfg.APIAddr // already includes env override from loadEnv
 	if apiAddrFlag != "" {
 		apiAddr = apiAddrFlag
 	}
-	apiServer := api.NewServer(clients, apiAddr, inboxStore)
+	apiServer := api.NewServer(clients, apiAddr, inboxStore, handler)
 	go func() {
 		if err := apiServer.Run(ctx); err != nil {
 			log.Printf("API server error: %v", err)
@@ -208,6 +233,20 @@ func runStart(cmd *cobra.Command, args []string) error {
 	wg.Wait()
 	log.Println("All monitors stopped")
 	return nil
+}
+
+func selectLocalClient(clients map[string]*ilink.Client, defaultClient *ilink.Client, accountID string) (*ilink.Client, error) {
+	if accountID != "" {
+		client, ok := clients[accountID]
+		if !ok {
+			return nil, fmt.Errorf("unknown account_id: %s", accountID)
+		}
+		return client, nil
+	}
+	if defaultClient == nil {
+		return nil, fmt.Errorf("no accounts configured")
+	}
+	return defaultClient, nil
 }
 
 // runMonitorWithRestart runs a monitor with automatic restart on failure.
@@ -358,6 +397,10 @@ func doLogin(ctx context.Context) (*ilink.Credentials, error) {
 // --- Daemon mode ---
 
 func weclawDir() string {
+	path, err := config.ConfigPath()
+	if err == nil && path != "" {
+		return filepath.Dir(path)
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".weclaw")
 }

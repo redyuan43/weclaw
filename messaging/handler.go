@@ -44,10 +44,16 @@ type Handler struct {
 	contextTokens  sync.Map // map[userID]contextToken
 	saveDir        string   // directory to save images/files to
 	seenMsgs       sync.Map // map[int64]time.Time — dedup by message_id
-	bridge         *BridgeClient
+	bridge         *BridgeRuntime
 	inbox          *InboxStore
 	localTimeout   time.Duration
 	slowReplyDelay time.Duration
+}
+
+type LocalAgentChatResult struct {
+	AgentName string
+	Info      agent.AgentInfo
+	Reply     string
 }
 
 // NewHandler creates a new message handler.
@@ -62,13 +68,19 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 	}
 }
 
+func (h *Handler) SetDefaultAgentName(name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.defaultName = name
+}
+
 // SetSaveDir sets the directory for saving images and files.
 func (h *Handler) SetSaveDir(dir string) {
 	h.saveDir = dir
 }
 
-// SetBridge configures optional forwarding of selected chats to the A2A bridge.
-func (h *Handler) SetBridge(bridge *BridgeClient) {
+// SetBridge configures optional in-process A2A bridge runtime.
+func (h *Handler) SetBridge(bridge *BridgeRuntime) {
 	h.bridge = bridge
 }
 
@@ -381,12 +393,15 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		return
 	}
 
-	bridged := false
-	suppressed := false
-	if h.bridge != nil {
-		routeMode, normalized, allowed, ignored := h.bridge.Eligible(msg, text)
-		suppressed = ignored
+	// Route: "/agentname message" or "@agent1 @agent2 message" -> specific agent(s)
+	agentNames, message := h.parseCommand(text)
+	if len(agentNames) == 0 {
 		if h.inbox != nil {
+			normalized := text
+			suppressed := false
+			if h.bridge != nil {
+				normalized, suppressed = h.bridge.NormalizeIncomingText(text)
+			}
 			h.inbox.Append(InboxRecord{
 				MessageID:    msg.MessageID,
 				FromUserID:   msg.FromUserID,
@@ -396,47 +411,40 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 				Suppressed:   suppressed,
 			})
 		}
-		if suppressed {
-			log.Printf("[handler] suppressed bridge-prefixed message from %s", msg.FromUserID)
-			return
-		}
-		if allowed {
-			resp, err := h.bridge.Forward(ctx, client.BotID(), msg, normalized, routeMode)
+
+		if h.bridge != nil {
+			result, err := h.bridge.HandleWeClawInbound(ctx, WeClawInbound{
+				AccountID:    client.BotID(),
+				FromUserID:   msg.FromUserID,
+				Text:         text,
+				RouteMode:    "auto",
+				MessageID:    fmt.Sprintf("%d", msg.MessageID),
+				ContextToken: msg.ContextToken,
+			})
 			if err != nil {
-				log.Printf("[handler] bridge forward failed for %s, falling back: %v", msg.FromUserID, err)
-			} else if resp != nil && resp.Accepted {
-				bridged = true
-				if h.inbox != nil {
+				log.Printf("[handler] bridge runtime failed for %s: %v", msg.FromUserID, err)
+				return
+			}
+			if result != nil {
+				if h.inbox != nil && result.Route == "peer" {
 					h.inbox.Append(InboxRecord{
 						MessageID:    msg.MessageID,
 						FromUserID:   msg.FromUserID,
 						ToUserID:     msg.ToUserID,
-						Text:         normalized,
+						Text:         text,
 						ContextToken: msg.ContextToken,
 						Bridged:      true,
 					})
 				}
-				log.Printf("[handler] bridged message from %s to %s (%s)", msg.FromUserID, routeMode, resp.Detail)
-				return
+				if result.Route == "suppressed" {
+					log.Printf("[handler] suppressed bridge-prefixed message from %s", msg.FromUserID)
+				} else {
+					log.Printf("[handler] bridge runtime handled message from %s (%s)", msg.FromUserID, result.Detail)
+				}
 			}
+			return
 		}
-	} else if h.inbox != nil {
-		h.inbox.Append(InboxRecord{
-			MessageID:    msg.MessageID,
-			FromUserID:   msg.FromUserID,
-			ToUserID:     msg.ToUserID,
-			Text:         text,
-			ContextToken: msg.ContextToken,
-		})
-	}
 
-	_ = bridged
-
-	// Route: "/agentname message" or "@agent1 @agent2 message" -> specific agent(s)
-	agentNames, message := h.parseCommand(text)
-
-	// No command prefix -> send to default agent
-	if len(agentNames) == 0 {
 		h.sendToDefaultAgent(ctx, client, msg, text, clientID)
 		return
 	}
@@ -652,6 +660,43 @@ func (h *Handler) chatWithAgent(ctx context.Context, ag agent.Agent, userID, mes
 
 	log.Printf("[handler] agent replied (%s, elapsed=%s): %q", info, elapsed, truncate(reply, 100))
 	return reply, nil
+}
+
+func (h *Handler) ChatLocalAgent(ctx context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error) {
+	name := strings.TrimSpace(agentName)
+	if name == "" {
+		h.mu.RLock()
+		name = h.defaultName
+		h.mu.RUnlock()
+	}
+	if name == "" {
+		return nil, fmt.Errorf("no default agent configured")
+	}
+
+	ag, err := h.getAgent(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+
+	chatCtx, cancel := h.withLocalAgentTimeout(ctx)
+	defer cancel()
+
+	reply, err := h.chatWithAgent(chatCtx, ag, conversationID, message)
+	if err != nil {
+		return nil, err
+	}
+	return &LocalAgentChatResult{
+		AgentName: name,
+		Info:      ag.Info(),
+		Reply:     reply,
+	}, nil
+}
+
+func (h *Handler) HandleBridgeRequest(ctx context.Context, request TaskRequest) (*TaskResult, error) {
+	if h.bridge == nil {
+		return nil, fmt.Errorf("bridge runtime unavailable")
+	}
+	return h.bridge.ReceiveRequest(ctx, request)
 }
 
 func (h *Handler) withLocalAgentTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
