@@ -12,31 +12,40 @@ import (
 type Config struct {
 	DefaultAgent    string                 `json:"default_agent"`
 	APIAddr         string                 `json:"api_addr,omitempty"`
-	MediaServiceURL string                 `json:"media_service_url,omitempty"`
 	SaveDir         string                 `json:"save_dir,omitempty"`
+	MediaServiceURL string                 `json:"media_service_url,omitempty"`
 	Agents          map[string]AgentConfig `json:"agents"`
+	Bridge          BridgeConfig           `json:"bridge,omitempty"`
+}
+
+// BridgeConfig controls optional A2A bridge forwarding for selected chats.
+type BridgeConfig struct {
+	Enabled         bool     `json:"enabled,omitempty"`
+	Endpoint        string   `json:"endpoint,omitempty"`
+	Fallback        string   `json:"fallback,omitempty"`
+	ChatAllowlist   []string `json:"chat_allowlist,omitempty"`
+	IgnorePrefixes  []string `json:"ignore_prefixes,omitempty"`
+	RequestTimeoutS int      `json:"request_timeout_seconds,omitempty"`
 }
 
 // AgentConfig holds configuration for a single agent.
 type AgentConfig struct {
-	Type         string            `json:"type"`                    // "acp", "cli", or "http"
-	Command      string            `json:"command,omitempty"`       // binary path (cli/acp type)
-	Args         []string          `json:"args,omitempty"`          // extra args for command (e.g. ["acp"] for cursor)
-	Aliases      []string          `json:"aliases,omitempty"`       // custom trigger commands (e.g. ["gpt", "4o"])
-	Cwd          string            `json:"cwd,omitempty"`           // working directory (workspace)
-	Env          map[string]string `json:"env,omitempty"`           // extra environment variables (cli/acp type)
-	Model        string            `json:"model,omitempty"`         // model name
-	SystemPrompt string            `json:"system_prompt,omitempty"` // system prompt
-	Endpoint     string            `json:"endpoint,omitempty"`      // API endpoint (http type)
-	APIKey       string            `json:"api_key,omitempty"`       // API key (http type)
-	Headers      map[string]string `json:"headers,omitempty"`       // extra HTTP headers (http type)
-	MaxHistory   int               `json:"max_history,omitempty"`   // max history (http type)
+	Type         string            `json:"type"`
+	Command      string            `json:"command,omitempty"`
+	Args         []string          `json:"args,omitempty"`
+	Aliases      []string          `json:"aliases,omitempty"`
+	Cwd          string            `json:"cwd,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
+	Model        string            `json:"model,omitempty"`
+	SystemPrompt string            `json:"system_prompt,omitempty"`
+	Endpoint     string            `json:"endpoint,omitempty"`
+	APIKey       string            `json:"api_key,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	MaxHistory   int               `json:"max_history,omitempty"`
 }
 
 // BuildAliasMap builds a map from custom alias to agent name from all agent configs.
-// It logs warnings for conflicts: duplicate aliases and aliases shadowing agent keys.
 func BuildAliasMap(agents map[string]AgentConfig) map[string]string {
-	// Built-in commands that cannot be overridden
 	reserved := map[string]bool{
 		"info": true, "help": true, "new": true, "clear": true, "cwd": true,
 	}
@@ -55,7 +64,6 @@ func BuildAliasMap(agents map[string]AgentConfig) map[string]string {
 		}
 	}
 
-	// Warn if a custom alias shadows an agent key
 	for alias, target := range m {
 		if _, isAgent := agents[alias]; isAgent && alias != target {
 			log.Printf("[config] WARNING: alias %q (-> %q) shadows agent key %q", alias, target, alias)
@@ -69,6 +77,7 @@ func BuildAliasMap(agents map[string]AgentConfig) map[string]string {
 func DefaultConfig() *Config {
 	return &Config{
 		Agents: make(map[string]AgentConfig),
+		Bridge: BridgeConfig{Fallback: "local_agent", RequestTimeoutS: 10},
 	}
 }
 
@@ -105,6 +114,12 @@ func Load() (*Config, error) {
 	if cfg.Agents == nil {
 		cfg.Agents = make(map[string]AgentConfig)
 	}
+	if cfg.Bridge.Fallback == "" {
+		cfg.Bridge.Fallback = "local_agent"
+	}
+	if cfg.Bridge.RequestTimeoutS == 0 {
+		cfg.Bridge.RequestTimeoutS = 10
+	}
 
 	loadEnv(cfg)
 	return cfg, nil
@@ -117,11 +132,11 @@ func loadEnv(cfg *Config) {
 	if v := os.Getenv("WECLAW_API_ADDR"); v != "" {
 		cfg.APIAddr = v
 	}
-	if v := os.Getenv("WECLAW_MEDIA_SERVICE_URL"); v != "" {
-		cfg.MediaServiceURL = v
-	}
 	if v := os.Getenv("WECLAW_SAVE_DIR"); v != "" {
 		cfg.SaveDir = v
+	}
+	if v := os.Getenv("WECLAW_MEDIA_SERVICE_URL"); v != "" {
+		cfg.MediaServiceURL = v
 	}
 }
 

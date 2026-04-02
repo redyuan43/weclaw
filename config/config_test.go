@@ -117,3 +117,31 @@ func TestLoadEnvOverridesTopLevelOnly(t *testing.T) {
 		t.Fatalf("agent env = %q, want preserved value", got)
 	}
 }
+
+func TestBridgeConfigRoundTrip(t *testing.T) {
+	cfg := Config{
+		Agents: map[string]AgentConfig{},
+		Bridge: BridgeConfig{
+			Enabled:         true,
+			Endpoint:        "http://127.0.0.1:8781/im/weclaw/inbound",
+			Fallback:        "local_agent",
+			ChatAllowlist:   []string{"user@im.wechat"},
+			IgnorePrefixes:  []string{"[A2A-BRIDGE] "},
+			RequestTimeoutS: 9,
+		},
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal bridge config: %v", err)
+	}
+
+	var decoded Config
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal bridge config: %v", err)
+	}
+
+	if !decoded.Bridge.Enabled || decoded.Bridge.Endpoint == "" || decoded.Bridge.RequestTimeoutS != 9 {
+		t.Fatalf("decoded bridge = %#v", decoded.Bridge)
+	}
+}

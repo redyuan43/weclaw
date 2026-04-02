@@ -43,6 +43,8 @@ type Handler struct {
 	contextTokens sync.Map // map[userID]contextToken
 	saveDir       string   // directory to save images/files to
 	seenMsgs      sync.Map // map[int64]time.Time — dedup by message_id
+	bridge        *BridgeClient
+	inbox         *InboxStore
 }
 
 // NewHandler creates a new message handler.
@@ -58,6 +60,16 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 // SetSaveDir sets the directory for saving images and files.
 func (h *Handler) SetSaveDir(dir string) {
 	h.saveDir = dir
+}
+
+// SetBridge configures optional forwarding of selected chats to the A2A bridge.
+func (h *Handler) SetBridge(bridge *BridgeClient) {
+	h.bridge = bridge
+}
+
+// SetInboxStore configures a recent inbound-message store for local automation and testing.
+func (h *Handler) SetInboxStore(store *InboxStore) {
+	h.inbox = store
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -363,6 +375,57 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		}
 		return
 	}
+
+	bridged := false
+	suppressed := false
+	if h.bridge != nil {
+		routeMode, normalized, allowed, ignored := h.bridge.Eligible(msg, text)
+		suppressed = ignored
+		if h.inbox != nil {
+			h.inbox.Append(InboxRecord{
+				MessageID:    msg.MessageID,
+				FromUserID:   msg.FromUserID,
+				ToUserID:     msg.ToUserID,
+				Text:         normalized,
+				ContextToken: msg.ContextToken,
+				Suppressed:   suppressed,
+			})
+		}
+		if suppressed {
+			log.Printf("[handler] suppressed bridge-prefixed message from %s", msg.FromUserID)
+			return
+		}
+		if allowed {
+			resp, err := h.bridge.Forward(ctx, client.BotID(), msg, normalized, routeMode)
+			if err != nil {
+				log.Printf("[handler] bridge forward failed for %s, falling back: %v", msg.FromUserID, err)
+			} else if resp != nil && resp.Accepted {
+				bridged = true
+				if h.inbox != nil {
+					h.inbox.Append(InboxRecord{
+						MessageID:    msg.MessageID,
+						FromUserID:   msg.FromUserID,
+						ToUserID:     msg.ToUserID,
+						Text:         normalized,
+						ContextToken: msg.ContextToken,
+						Bridged:      true,
+					})
+				}
+				log.Printf("[handler] bridged message from %s to %s (%s)", msg.FromUserID, routeMode, resp.Detail)
+				return
+			}
+		}
+	} else if h.inbox != nil {
+		h.inbox.Append(InboxRecord{
+			MessageID:    msg.MessageID,
+			FromUserID:   msg.FromUserID,
+			ToUserID:     msg.ToUserID,
+			Text:         text,
+			ContextToken: msg.ContextToken,
+		})
+	}
+
+	_ = bridged
 
 	// Route: "/agentname message" or "@agent1 @agent2 message" -> specific agent(s)
 	agentNames, message := h.parseCommand(text)

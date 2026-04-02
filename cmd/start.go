@@ -97,6 +97,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("Available agents: %v (default: %s)", names, cfg.DefaultAgent)
 	}
 
+	// Create local inbox store for bridge/test automation.
+	inboxStore := messaging.NewInboxStore(500)
+
 	// Create handler with an agent factory for on-demand agent creation
 	handler := messaging.NewHandler(
 		func(ctx context.Context, name string) agent.Agent {
@@ -135,6 +138,22 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	// Load custom aliases from agent configs
 	handler.SetCustomAliases(config.BuildAliasMap(cfg.Agents))
+	handler.SetInboxStore(inboxStore)
+	if cfg.Bridge.Enabled && cfg.Bridge.Endpoint != "" {
+		allow := make(map[string]struct{}, len(cfg.Bridge.ChatAllowlist))
+		for _, chatID := range cfg.Bridge.ChatAllowlist {
+			allow[chatID] = struct{}{}
+		}
+		handler.SetBridge(messaging.NewBridgeClient(messaging.BridgeConfig{
+			Enabled:        true,
+			Endpoint:       cfg.Bridge.Endpoint,
+			Fallback:       cfg.Bridge.Fallback,
+			ChatAllowlist:  allow,
+			IgnorePrefixes: cfg.Bridge.IgnorePrefixes,
+			Timeout:        time.Duration(cfg.Bridge.RequestTimeoutS) * time.Second,
+		}))
+		log.Printf("[bridge] enabled for %d chat(s) -> %s", len(allow), cfg.Bridge.Endpoint)
+	}
 
 	// Set save directory for images/files if configured
 	if cfg.SaveDir != "" {
@@ -167,7 +186,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if apiAddrFlag != "" {
 		apiAddr = apiAddrFlag
 	}
-	apiServer := api.NewServer(clients, apiAddr)
+	apiServer := api.NewServer(clients, apiAddr, inboxStore)
 	go func() {
 		if err := apiServer.Run(ctx); err != nil {
 			log.Printf("API server error: %v", err)
