@@ -386,6 +386,176 @@ func TestBridgeRuntimePeerUserQuestionIsRewrittenByPeerAgent(t *testing.T) {
 	}
 }
 
+func TestBridgeRuntimePeerUserProxyMetaReplyStaysLocal(t *testing.T) {
+	recorder := &testBridgeRecorder{}
+	runtime := NewBridgeRuntime(
+		BridgeConfig{
+			Enabled:           true,
+			NodeID:            "remote-node",
+			PeerNodeID:        "local-node",
+			PeerBaseURL:       "http://peer.example",
+			LocalUserID:       "local-user@im.wechat",
+			LocalAgentAliases: []string{"幽浮喵", "UFO"},
+		},
+		BridgeRuntimeDeps{
+			Chat: func(_ context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error) {
+				recorder.chatCalls++
+				if strings.Contains(message, "Allowed kinds: answer_pending_question, clarify_identity_and_reask, new_local_request.") {
+					return &LocalAgentChatResult{
+						AgentName: "codex",
+						Reply:     `{"kind":"clarify_identity_and_reask","message":"主人，我是幽浮喵，MTM 那边想问你：今天晚上的作业做完了吗？","rationale":"meta clarification"}`,
+					}, nil
+				}
+				return &LocalAgentChatResult{
+					AgentName: "codex",
+					Reply:     `{"action":"need_more_info_from_local_user","message":"主人，我是幽浮喵，MTM 那边想问你：今天晚上的作业做完了吗？","target_node":null,"rationale":"peer-user-proxy rewrite","follow_up_needed":true}`,
+				}, nil
+			},
+			SendText: func(_ context.Context, accountID, toUserID, text, contextToken string) error {
+				recorder.sendCalls = append(recorder.sendCalls, testBridgeSend{
+					accountID:    accountID,
+					toUserID:     toUserID,
+					text:         text,
+					contextToken: contextToken,
+				})
+				return nil
+			},
+			Dispatch: func(_ context.Context, targetBaseURL string, request TaskRequest) (*TaskResult, error) {
+				recorder.dispatches = append(recorder.dispatches, request)
+				return &TaskResult{TaskID: request.Envelope.MessageID, Status: "queued", Accepted: true, Detail: "accepted"}, nil
+			},
+		},
+	)
+
+	question, err := runtime.ReceiveRequest(context.Background(), TaskRequest{
+		Envelope: newEnvelope("conv-proxy-2", "local-node", "remote-node", "local-user@im.wechat", "task-a", "task-a"),
+		TaskType: "peer_user_question",
+		Payload: map[string]any{
+			"text":                  "问一下NX1，今天晚上的作业你有做完吗？",
+			"question_text":         "今天晚上的作业做完了吗？",
+			"requester_agent_label": "MTM",
+			"requester_user_id":     "user-a@im.wechat",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReceiveRequest returned error: %v", err)
+	}
+	if !question.Accepted {
+		t.Fatalf("question result = %#v, want accepted", question)
+	}
+
+	waitForCondition(t, func() bool { return len(recorder.sendCalls) == 1 })
+	recorder.sendCalls = nil
+
+	result, err := runtime.HandleWeClawInbound(context.Background(), WeClawInbound{
+		AccountID:  "bot-remote",
+		FromUserID: "local-user@im.wechat",
+		Text:       "你是谁啊",
+	})
+	if err != nil {
+		t.Fatalf("HandleWeClawInbound returned error: %v", err)
+	}
+	if !result.Accepted || result.Route != "clarify" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	waitForCondition(t, func() bool { return len(recorder.sendCalls) == 1 })
+	if got := recorder.sendCalls[0].text; got != "主人，我是幽浮喵，MTM 那边想问你：今天晚上的作业做完了吗？" {
+		t.Fatalf("clarification reply = %q, want local clarification", got)
+	}
+	if len(recorder.dispatches) != 0 {
+		t.Fatalf("dispatches = %#v, want no peer dispatch for meta reply", recorder.dispatches)
+	}
+	pending := runtime.store.PendingForUser("local-user@im.wechat")
+	if pending == nil {
+		t.Fatal("pending proxy question was cleared, want it preserved")
+	}
+}
+
+func TestBridgeRuntimePeerUserProxyAnswerForwardsToPeer(t *testing.T) {
+	recorder := &testBridgeRecorder{}
+	runtime := NewBridgeRuntime(
+		BridgeConfig{
+			Enabled:           true,
+			NodeID:            "remote-node",
+			PeerNodeID:        "local-node",
+			PeerBaseURL:       "http://peer.example",
+			LocalUserID:       "local-user@im.wechat",
+			LocalAgentAliases: []string{"幽浮喵", "UFO"},
+		},
+		BridgeRuntimeDeps{
+			Chat: func(_ context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error) {
+				recorder.chatCalls++
+				if strings.Contains(message, "Allowed kinds: answer_pending_question, clarify_identity_and_reask, new_local_request.") {
+					return &LocalAgentChatResult{
+						AgentName: "codex",
+						Reply:     `{"kind":"answer_pending_question","message":"做完了","rationale":"direct answer"}`,
+					}, nil
+				}
+				return &LocalAgentChatResult{
+					AgentName: "codex",
+					Reply:     `{"action":"need_more_info_from_local_user","message":"主人，我是幽浮喵，MTM 那边想问你：今天晚上的作业做完了吗？","target_node":null,"rationale":"peer-user-proxy rewrite","follow_up_needed":true}`,
+				}, nil
+			},
+			SendText: func(_ context.Context, accountID, toUserID, text, contextToken string) error {
+				recorder.sendCalls = append(recorder.sendCalls, testBridgeSend{
+					accountID:    accountID,
+					toUserID:     toUserID,
+					text:         text,
+					contextToken: contextToken,
+				})
+				return nil
+			},
+			Dispatch: func(_ context.Context, targetBaseURL string, request TaskRequest) (*TaskResult, error) {
+				recorder.dispatches = append(recorder.dispatches, request)
+				return &TaskResult{TaskID: request.Envelope.MessageID, Status: "queued", Accepted: true, Detail: "accepted"}, nil
+			},
+		},
+	)
+
+	question, err := runtime.ReceiveRequest(context.Background(), TaskRequest{
+		Envelope: newEnvelope("conv-proxy-3", "local-node", "remote-node", "local-user@im.wechat", "task-a", "task-a"),
+		TaskType: "peer_user_question",
+		Payload: map[string]any{
+			"question_text":         "今天晚上的作业做完了吗？",
+			"requester_agent_label": "MTM",
+			"requester_user_id":     "user-a@im.wechat",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReceiveRequest returned error: %v", err)
+	}
+	if !question.Accepted {
+		t.Fatalf("question result = %#v, want accepted", question)
+	}
+	waitForCondition(t, func() bool {
+		pending := runtime.store.PendingForUser("local-user@im.wechat")
+		return pending != nil && len(recorder.sendCalls) == 1
+	})
+	recorder.sendCalls = nil
+
+	result, err := runtime.HandleWeClawInbound(context.Background(), WeClawInbound{
+		AccountID:  "bot-remote",
+		FromUserID: "local-user@im.wechat",
+		Text:       "做完了",
+	})
+	if err != nil {
+		t.Fatalf("HandleWeClawInbound returned error: %v", err)
+	}
+	if !result.Accepted || result.Route != "peer" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	waitForCondition(t, func() bool { return len(recorder.dispatches) == 1 })
+	if recorder.dispatches[0].TaskType != "peer_user_answer" {
+		t.Fatalf("taskType = %q, want peer_user_answer", recorder.dispatches[0].TaskType)
+	}
+	if recorder.dispatches[0].Payload["text"] != "做完了" {
+		t.Fatalf("forwarded answer = %#v, want 做完了", recorder.dispatches[0].Payload["text"])
+	}
+	if len(recorder.sendCalls) != 0 {
+		t.Fatalf("sendCalls = %#v, want no local clarification for direct answer", recorder.sendCalls)
+	}
+}
+
 func TestInboxStoreFiltersByAfterSeq(t *testing.T) {
 	store := NewInboxStore(10)
 	store.Append(InboxRecord{FromUserID: "a", Text: "one"})

@@ -93,6 +93,12 @@ type BridgeDecision struct {
 	FollowUpNeeded bool    `json:"follow_up_needed"`
 }
 
+type ProxyReplyDecision struct {
+	Kind      string `json:"kind"`
+	Message   string `json:"message"`
+	Rationale string `json:"rationale"`
+}
+
 type BridgeHistoryEntry struct {
 	Actor   string `json:"actor"`
 	Content string `json:"content"`
@@ -123,6 +129,10 @@ type BridgeTask struct {
 const (
 	waitingScopeLocalUserFollowUp = "local_user_follow_up"
 	waitingScopePeerUserProxy     = "peer_user_proxy"
+
+	proxyReplyAnswerPending   = "answer_pending_question"
+	proxyReplyClarifyAndReask = "clarify_identity_and_reask"
+	proxyReplyNewLocalRequest = "new_local_request"
 )
 
 type BridgeRuntimeDeps struct {
@@ -246,6 +256,9 @@ func (r *BridgeRuntime) HandleWeClawInbound(ctx context.Context, inbound WeClawI
 	}
 	if pending := r.store.PendingForUser(inbound.FromUserID); pending != nil {
 		r.logf(pending, "matched pending local question for user=%s", inbound.FromUserID)
+		if pending.Metadata["waiting_scope"] == waitingScopePeerUserProxy {
+			return r.handlePeerUserProxyReply(ctx, pending, text, inbound)
+		}
 		return r.resumeFromLocalUser(ctx, pending, text, inbound)
 	}
 
@@ -743,6 +756,95 @@ func (r *BridgeRuntime) resumeFromLocalUser(ctx context.Context, task *BridgeTas
 	return r.processTask(ctx, task)
 }
 
+func (r *BridgeRuntime) handlePeerUserProxyReply(ctx context.Context, task *BridgeTask, content string, inbound WeClawInbound) (*TaskResult, error) {
+	task.Metadata["account_id"] = firstNonBlank(task.Metadata["account_id"], inbound.AccountID)
+	task.Metadata["context_token"] = inbound.ContextToken
+	task.appendHistory("local_user", content)
+	r.logf(task, "classifying proxy reply text=%q", truncate(content, 120))
+
+	decision, err := r.classifyPeerUserProxyReply(ctx, task, content)
+	if err != nil {
+		r.logf(task, "proxy reply classification failed, falling back to clarify: %v", err)
+		decision = ProxyReplyDecision{
+			Kind:      proxyReplyClarifyAndReask,
+			Message:   r.defaultProxyClarification(task),
+			Rationale: "fallback after classification failure",
+		}
+	}
+	r.logf(task, "proxy reply classified kind=%s rationale=%q message=%q", decision.Kind, decision.Rationale, truncate(decision.Message, 120))
+
+	switch decision.Kind {
+	case proxyReplyAnswerPending:
+		forward := firstNonBlank(strings.TrimSpace(decision.Message), content)
+		request := TaskRequest{
+			Envelope: newEnvelope(task.ConversationID, r.cfg.NodeID, task.RequesterNodeID, task.ReplyUserID, task.TaskID, task.ParentTaskID),
+			TaskType: "peer_user_answer",
+			Payload: map[string]any{
+				"text": forward,
+			},
+		}
+		r.logf(task, "dispatching classified peer_user_answer to requester=%s text=%q", task.RequesterNodeID, truncate(forward, 120))
+		result, dispatchErr := r.dispatchToPeer(ctx, task.RequesterNodeID, request)
+		if dispatchErr != nil {
+			task.fail(dispatchErr.Error())
+			r.store.Save(task)
+			return &TaskResult{TaskID: task.TaskID, Status: string(task.Status), Accepted: false, Detail: dispatchErr.Error()}, nil
+		}
+		if !result.Accepted {
+			task.fail(result.Detail)
+			r.store.Save(task)
+			return &TaskResult{TaskID: task.TaskID, Status: string(task.Status), Accepted: false, Detail: result.Detail}, nil
+		}
+		task.complete(forward)
+		r.store.Save(task)
+		r.logf(task, "completed after classified peer_user_answer return")
+		return &TaskResult{
+			TaskID:   task.TaskID,
+			Status:   string(task.Status),
+			Accepted: true,
+			Detail:   "peer user answer queued",
+			Route:    "peer",
+		}, nil
+
+	case proxyReplyNewLocalRequest:
+		newText := firstNonBlank(strings.TrimSpace(decision.Message), content)
+		newTask := newLocalBridgeTask(r.cfg.NodeID, r.cfg.LocalUserID, inbound.FromUserID, newText)
+		newTask.Metadata["route_mode"] = "auto"
+		newTask.Metadata["account_id"] = inbound.AccountID
+		newTask.Metadata["context_token"] = inbound.ContextToken
+		newTask.Metadata["external_message_id"] = inbound.MessageID
+		newTask.appendHistory("local_user", newText)
+		r.store.Save(newTask)
+		r.logf(newTask, "created new local task while proxy question remains pending")
+		r.processTaskAsync(newTask)
+		return &TaskResult{
+			TaskID:   newTask.TaskID,
+			Status:   string(newTask.Status),
+			Accepted: true,
+			Detail:   "new local request queued",
+			Route:    "queued",
+		}, nil
+
+	default:
+		reply := firstNonBlank(strings.TrimSpace(decision.Message), r.defaultProxyClarification(task))
+		r.logf(task, "answering proxy clarification locally and keeping pending")
+		if err := r.sendText(ctx, task.Metadata["account_id"], task.ReplyUserID, reply, task.Metadata["context_token"]); err != nil {
+			task.fail(err.Error())
+			r.store.Save(task)
+			return &TaskResult{TaskID: task.TaskID, Status: string(task.Status), Accepted: false, Detail: err.Error()}, nil
+		}
+		task.setStatus(BridgeTaskWaitingLocalUser, "proxy_clarification")
+		r.store.Save(task)
+		return &TaskResult{
+			TaskID:   task.TaskID,
+			Status:   string(task.Status),
+			Accepted: true,
+			Detail:   "proxy clarification answered locally",
+			Route:    "clarify",
+		}, nil
+	}
+}
+
 func (r *BridgeRuntime) sendFailureNotice(ctx context.Context, task *BridgeTask, err error) {
 	if task == nil || r.sendText == nil {
 		return
@@ -855,6 +957,26 @@ func (r *BridgeRuntime) buildDecisionPrompt(task *BridgeTask, targetNode string)
 		"- Treat shortened or fuzzy references to configured aliases as valid mentions.\n" +
 		"- Keep message concise and directly usable.\n" +
 		"- If unsure, choose need_more_info_from_local_user.\n" +
+		"Context:\n" + mustJSON(compact)
+}
+
+func (r *BridgeRuntime) buildProxyReplyClassificationPrompt(task *BridgeTask, content string) string {
+	compact := map[string]any{
+		"node_id":             r.cfg.NodeID,
+		"local_agent_aliases": r.cfg.LocalAgentAliases,
+		"requester_agent":     task.Metadata["requester_agent_label"],
+		"pending_question":    task.Metadata["proxy_question_text"],
+		"latest_local_reply":  content,
+		"history":             task.History,
+	}
+	return "Return one JSON object only with keys: kind, message, rationale.\n" +
+		"Allowed kinds: answer_pending_question, clarify_identity_and_reask, new_local_request.\n" +
+		"Rules:\n" +
+		"- answer_pending_question: the user is answering the pending question. message should be the answer to forward.\n" +
+		"- clarify_identity_and_reask: the user is asking who you are, who asked, why you are asking, or other context questions. message must explain who you are and who asked, then restate the pending question in one natural sentence.\n" +
+		"- new_local_request: the user is starting a clearly separate new request unrelated to the pending question. message should be the new local request text.\n" +
+		"- Do not forward clarification or meta questions as answers.\n" +
+		"- Do not use markdown fences.\n" +
 		"Context:\n" + mustJSON(compact)
 }
 
@@ -1035,6 +1157,39 @@ func containsBridgeKeyword(text string, keywords ...string) bool {
 
 func wantsReplyBack(text string) bool {
 	return containsBridgeKeyword(text, "回复后再转告我", "再转告我", "告诉我结果", "告诉我", "回我", "reply back", "tell me the result", "let me know")
+}
+
+func (r *BridgeRuntime) classifyPeerUserProxyReply(ctx context.Context, task *BridgeTask, content string) (ProxyReplyDecision, error) {
+	if r.chat == nil {
+		return ProxyReplyDecision{}, fmt.Errorf("bridge chat dependency is not configured")
+	}
+	chatResult, err := r.chat(ctx, fmt.Sprintf("a2a-proxy-reply:%s:%s", firstNonBlank(r.cfg.NodeID, "node"), task.TaskID), r.buildProxyReplyClassificationPrompt(task, content), "")
+	if err != nil {
+		return ProxyReplyDecision{}, err
+	}
+	rawReply := ""
+	if chatResult != nil {
+		rawReply = chatResult.Reply
+	}
+	r.logf(task, "proxy classifier raw reply=%q", truncate(strings.TrimSpace(rawReply), 160))
+
+	var decision ProxyReplyDecision
+	if err := json.Unmarshal([]byte(stripMarkdownFences(rawReply)), &decision); err != nil {
+		return ProxyReplyDecision{}, err
+	}
+	switch decision.Kind {
+	case proxyReplyAnswerPending, proxyReplyClarifyAndReask, proxyReplyNewLocalRequest:
+		return decision, nil
+	default:
+		return ProxyReplyDecision{}, fmt.Errorf("unsupported proxy reply kind: %s", decision.Kind)
+	}
+}
+
+func (r *BridgeRuntime) defaultProxyClarification(task *BridgeTask) string {
+	localAgent := firstNonBlank(firstAlias(r.cfg.LocalAgentAliases), r.cfg.NodeID)
+	requesterAgent := firstNonBlank(task.Metadata["requester_agent_label"], task.RequesterNodeID, "对端助手")
+	question := firstNonBlank(task.Metadata["proxy_question_text"], task.CurrentInput)
+	return fmt.Sprintf("主人，我是%s，%s 那边想问你：%s", localAgent, requesterAgent, question)
 }
 
 func firstAlias(values []string) string {
