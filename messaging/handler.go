@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -31,29 +32,33 @@ type AgentMeta struct {
 
 // Handler processes incoming WeChat messages and dispatches replies.
 type Handler struct {
-	mu            sync.RWMutex
-	defaultName   string
-	agents        map[string]agent.Agent // name -> running agent
-	agentMetas    []AgentMeta            // all configured agents (for /status)
-	agentWorkDirs map[string]string      // agent name -> configured/runtime cwd
-	customAliases map[string]string      // custom alias -> agent name (from config)
-	factory       AgentFactory
-	saveDefault   SaveDefaultFunc
-	mediaService  *MediaServiceClient
-	contextTokens sync.Map // map[userID]contextToken
-	saveDir       string   // directory to save images/files to
-	seenMsgs      sync.Map // map[int64]time.Time — dedup by message_id
-	bridge        *BridgeClient
-	inbox         *InboxStore
+	mu             sync.RWMutex
+	defaultName    string
+	agents         map[string]agent.Agent // name -> running agent
+	agentMetas     []AgentMeta            // all configured agents (for /status)
+	agentWorkDirs  map[string]string      // agent name -> configured/runtime cwd
+	customAliases  map[string]string      // custom alias -> agent name (from config)
+	factory        AgentFactory
+	saveDefault    SaveDefaultFunc
+	mediaService   *MediaServiceClient
+	contextTokens  sync.Map // map[userID]contextToken
+	saveDir        string   // directory to save images/files to
+	seenMsgs       sync.Map // map[int64]time.Time — dedup by message_id
+	bridge         *BridgeClient
+	inbox          *InboxStore
+	localTimeout   time.Duration
+	slowReplyDelay time.Duration
 }
 
 // NewHandler creates a new message handler.
 func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 	return &Handler{
-		agents:        make(map[string]agent.Agent),
-		agentWorkDirs: make(map[string]string),
-		factory:       factory,
-		saveDefault:   saveDefault,
+		agents:         make(map[string]agent.Agent),
+		agentWorkDirs:  make(map[string]string),
+		factory:        factory,
+		saveDefault:    saveDefault,
+		localTimeout:   2 * time.Minute,
+		slowReplyDelay: 3 * time.Second,
 	}
 }
 
@@ -499,10 +504,15 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 	ag := h.getDefaultAgent()
 	var reply string
 	if ag != nil {
+		chatCtx, cancel := h.withLocalAgentTimeout(ctx)
+		defer cancel()
+		stopNotice := h.startSlowReplyNotice(chatCtx, client, msg)
+		defer stopNotice()
+
 		var err error
-		reply, err = h.chatWithAgent(ctx, ag, msg.FromUserID, text)
+		reply, err = h.chatWithAgent(chatCtx, ag, msg.FromUserID, text)
 		if err != nil {
-			reply = fmt.Sprintf("Error: %v", err)
+			reply = formatAgentError(err, h.localTimeout)
 		}
 	} else {
 		log.Printf("[handler] agent not ready, using echo mode for %s", msg.FromUserID)
@@ -522,9 +532,14 @@ func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, ms
 		return
 	}
 
-	reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, message)
+	chatCtx, cancel := h.withLocalAgentTimeout(ctx)
+	defer cancel()
+	stopNotice := h.startSlowReplyNotice(chatCtx, client, msg)
+	defer stopNotice()
+
+	reply, err := h.chatWithAgent(chatCtx, ag, msg.FromUserID, message)
 	if err != nil {
-		reply = fmt.Sprintf("Error: %v", err)
+		reply = formatAgentError(err, h.localTimeout)
 	}
 	h.sendReplyWithMedia(ctx, client, msg, name, reply, clientID)
 }
@@ -537,18 +552,23 @@ func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, m
 		reply string
 	}
 
+	chatCtx, cancel := h.withLocalAgentTimeout(ctx)
+	defer cancel()
+	stopNotice := h.startSlowReplyNotice(chatCtx, client, msg)
+	defer stopNotice()
+
 	ch := make(chan result, len(names))
 
 	for _, name := range names {
 		go func(n string) {
-			ag, err := h.getAgent(ctx, n)
+			ag, err := h.getAgent(chatCtx, n)
 			if err != nil {
 				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
 				return
 			}
-			reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, message)
+			reply, err := h.chatWithAgent(chatCtx, ag, msg.FromUserID, message)
 			if err != nil {
-				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
+				ch <- result{name: n, reply: formatAgentError(err, h.localTimeout)}
 				return
 			}
 			ch <- result{name: n, reply: reply}
@@ -632,6 +652,52 @@ func (h *Handler) chatWithAgent(ctx context.Context, ag agent.Agent, userID, mes
 
 	log.Printf("[handler] agent replied (%s, elapsed=%s): %q", info, elapsed, truncate(reply, 100))
 	return reply, nil
+}
+
+func (h *Handler) withLocalAgentTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if h.localTimeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, h.localTimeout)
+}
+
+func (h *Handler) startSlowReplyNotice(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage) func() {
+	if h.slowReplyDelay <= 0 {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(h.slowReplyDelay)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			notice := "已收到，正在处理中，请稍候。"
+			if err := SendTextReply(ctx, client, msg.FromUserID, notice, msg.ContextToken, NewClientID()); err != nil {
+				log.Printf("[handler] failed to send slow-reply notice to %s: %v", msg.FromUserID, err)
+			}
+		case <-done:
+		case <-ctx.Done():
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+		})
+	}
+}
+
+func formatAgentError(err error, timeout time.Duration) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		if timeout > 0 {
+			return fmt.Sprintf("处理超时（超过 %s），请缩小问题范围后重试。", timeout.Round(time.Second))
+		}
+		return "处理超时，请稍后重试。"
+	}
+	return fmt.Sprintf("Error: %v", err)
 }
 
 // switchDefault switches the default agent. Starts it on demand if needed.
