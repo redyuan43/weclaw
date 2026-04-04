@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/fastclaw-ai/weclaw/controlplane"
 	"github.com/fastclaw-ai/weclaw/ilink"
 	"github.com/fastclaw-ai/weclaw/messaging"
 )
@@ -19,6 +20,7 @@ type Server struct {
 	addr          string
 	inbox         *messaging.InboxStore
 	handler       *messaging.Handler
+	userAgents    *controlplane.Service
 }
 
 // NewServer creates an API server.
@@ -38,6 +40,10 @@ func NewServer(clients []*ilink.Client, addr string, inbox *messaging.InboxStore
 		mapped[client.BotID()] = client
 	}
 	return &Server{clients: mapped, defaultClient: defaultClient, addr: addr, inbox: inbox, handler: handler}
+}
+
+func (s *Server) SetUserAgents(service *controlplane.Service) {
+	s.userAgents = service
 }
 
 // SendRequest is the JSON body for POST /api/send.
@@ -62,6 +68,10 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/api/bridge/inbound", s.handleBridgeInbound)
 	mux.HandleFunc("/api/inbox", s.handleInbox)
 	mux.HandleFunc("/api/inbox/clear", s.handleClearInbox)
+	mux.HandleFunc("/.well-known/agent-card.json", s.handleWellKnownAgentCard)
+	mux.HandleFunc("/a2a/users/", s.handleA2AUser)
+	mux.HandleFunc("/console", s.handleConsole)
+	mux.HandleFunc("/console/", s.handleConsoleAction)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")

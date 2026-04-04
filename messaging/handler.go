@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/agent"
+	"github.com/fastclaw-ai/weclaw/controlplane"
 	"github.com/fastclaw-ai/weclaw/ilink"
 	"github.com/google/uuid"
 )
@@ -46,6 +47,7 @@ type Handler struct {
 	seenMsgs       sync.Map // map[int64]time.Time — dedup by message_id
 	bridge         *BridgeRuntime
 	inbox          *InboxStore
+	userAgents     *controlplane.Service
 	localTimeout   time.Duration
 	slowReplyDelay time.Duration
 }
@@ -87,6 +89,10 @@ func (h *Handler) SetBridge(bridge *BridgeRuntime) {
 // SetInboxStore configures a recent inbound-message store for local automation and testing.
 func (h *Handler) SetInboxStore(store *InboxStore) {
 	h.inbox = store
+}
+
+func (h *Handler) SetUserAgents(service *controlplane.Service) {
+	h.userAgents = service
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -315,6 +321,14 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 			log.Printf("[handler] voice transcription from %s: %q", msg.FromUserID, truncate(text, 80))
 		}
 	}
+	ownerMessage := h.userAgents != nil && h.userAgents.IsOwnerContact(client.BotID(), msg.FromUserID)
+	if ownerMessage && strings.TrimSpace(text) != "" {
+		log.Printf("[handler] owner message routed to user-agent control plane account=%s from=%s", client.BotID(), msg.FromUserID)
+		h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
+		clientID := NewClientID()
+		h.handleOwnerMessage(ctx, client, msg, strings.TrimSpace(text), clientID)
+		return
+	}
 	if h.mediaService != nil {
 		incomingMedia, hasMedia, err := h.collectIncomingRichMedia(ctx, msg)
 		if err != nil {
@@ -344,9 +358,14 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 
 	// Generate a clientID for this reply (used to correlate typing → finish)
 	clientID := NewClientID()
+	trimmed := strings.TrimSpace(text)
+
+	if ownerMessage {
+		h.handleOwnerMessage(ctx, client, msg, trimmed, clientID)
+		return
+	}
 
 	// Intercept URLs: save to Linkhoard directly without AI agent
-	trimmed := strings.TrimSpace(text)
 	if h.saveDir != "" && IsURL(trimmed) {
 		rawURL := ExtractURL(trimmed)
 		if rawURL != "" {
@@ -495,6 +514,94 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		// Multi-agent broadcast: parallel dispatch, send replies as they arrive
 		h.broadcastToAgents(ctx, client, msg, knownNames, message)
 	}
+}
+
+func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, trimmed, clientID string) {
+	switch {
+	case trimmed == "/help" || trimmed == "/ua-help":
+		_ = SendTextReply(ctx, client, msg.FromUserID, buildOwnerHelpText(), msg.ContextToken, clientID)
+		return
+
+	case trimmed == "/tasks":
+		tasks, err := h.userAgents.ListTasks(20)
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("读取任务失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		reply := formatOwnerTaskList(client.BotID(), tasks)
+		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
+
+	case trimmed == "/agents":
+		profiles, err := h.userAgents.ListProfiles()
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("读取 Agent 列表失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		_ = SendTextReply(ctx, client, msg.FromUserID, formatOwnerAgentList(profiles), msg.ContextToken, clientID)
+		return
+
+	case trimmed == "/capabilities":
+		bindings, err := h.userAgents.ListCapabilityBindings(client.BotID())
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("读取能力失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		_ = SendTextReply(ctx, client, msg.FromUserID, formatOwnerCapabilities(bindings), msg.ContextToken, clientID)
+		return
+
+	case strings.HasPrefix(trimmed, "/approve "):
+		approvalID := strings.TrimSpace(strings.TrimPrefix(trimmed, "/approve"))
+		grant, err := h.userAgents.ApproveGrant(ctx, approvalID, msg.FromUserID)
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("批准失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		reply := fmt.Sprintf("已批准协作请求 %s，任务开始执行。", grant.ID)
+		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
+
+	case strings.HasPrefix(trimmed, "/reject "):
+		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "/reject"))
+		parts := strings.SplitN(payload, " ", 2)
+		approvalID := strings.TrimSpace(parts[0])
+		reason := ""
+		if len(parts) == 2 {
+			reason = strings.TrimSpace(parts[1])
+		}
+		grant, err := h.userAgents.RejectGrant(ctx, approvalID, reason)
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("拒绝失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		reply := fmt.Sprintf("已拒绝协作请求 %s。", grant.ID)
+		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
+
+	case strings.HasPrefix(trimmed, "/delegate "):
+		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "/delegate"))
+		parts := strings.SplitN(payload, " ", 2)
+		if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			_ = SendTextReply(ctx, client, msg.FromUserID, "用法：/delegate 目标账号或显示名 任务内容", msg.ContextToken, clientID)
+			return
+		}
+		task, grant, err := h.userAgents.CreateDelegation(ctx, client.BotID(), msg.FromUserID, parts[0], parts[1])
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("发起协作失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		reply := fmt.Sprintf("已发起协作任务 %s。\n授权编号：%s\n等待对方批准后执行。", shortTaskID(task.ID), grant.ID)
+		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
+	}
+
+	task, err := h.userAgents.SubmitOwnerTask(ctx, client.BotID(), msg.FromUserID, trimmed)
+	if err != nil {
+		_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("处理失败：%v", err), msg.ContextToken, clientID)
+		return
+	}
+	reply := fmt.Sprintf("[任务 %s]\n%s", shortTaskID(task.ID), task.ResultText)
+	h.sendReplyWithMedia(ctx, client, msg, task.AssignedAgentName, reply, clientID)
 }
 
 // sendToDefaultAgent sends the message to the default agent and replies.
@@ -884,6 +991,69 @@ func buildHelpText() string {
 /help - Show this help message
 
 Aliases: /cc(claude) /cx(codex) /cs(cursor) /km(kimi) /gm(gemini) /oc(openclaw) /ocd(opencode) /pi(pi) /cp(copilot) /dr(droid) /if(iflow) /kr(kiro) /qw(qwen)`
+}
+
+func buildOwnerHelpText() string {
+	return `用户 Agent 命令:
+/tasks - 查看最近任务
+/agents - 查看已注册用户 Agent
+/capabilities - 查看当前账号启用能力
+/delegate 目标 任务 - 发起跨用户协作
+/approve 授权编号 - 同意协作请求
+/reject 授权编号 原因 - 拒绝协作请求
+/help - 查看帮助
+
+直接发送普通文本，会交给当前账号的主 Agent 处理。`
+}
+
+func formatOwnerTaskList(accountID string, tasks []controlplane.TaskRecord) string {
+	var lines []string
+	for _, task := range tasks {
+		if task.RequesterAccountID != accountID && task.TargetAccountID != accountID && task.OwnerAccountID != accountID {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s [%s] %s", shortTaskID(task.ID), task.Status, task.Title))
+		if len(lines) >= 8 {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		return "最近没有任务。"
+	}
+	return "最近任务：\n" + strings.Join(lines, "\n")
+}
+
+func formatOwnerAgentList(profiles []controlplane.UserAgentProfile) string {
+	if len(profiles) == 0 {
+		return "暂无用户 Agent。"
+	}
+	var lines []string
+	for _, profile := range profiles {
+		lines = append(lines, fmt.Sprintf("%s -> %s", profile.AccountID, firstNonBlank(profile.DisplayName, profile.BaseAgentName)))
+	}
+	return "用户 Agent：\n" + strings.Join(lines, "\n")
+}
+
+func formatOwnerCapabilities(bindings []controlplane.CapabilityBinding) string {
+	if len(bindings) == 0 {
+		return "当前账号未启用能力。"
+	}
+	var lines []string
+	for _, binding := range bindings {
+		state := "关闭"
+		if binding.Enabled {
+			state = "开启"
+		}
+		lines = append(lines, fmt.Sprintf("%s [%s]", binding.Name, state))
+	}
+	return "当前能力：\n" + strings.Join(lines, "\n")
+}
+
+func shortTaskID(taskID string) string {
+	if len(taskID) <= 8 {
+		return taskID
+	}
+	return taskID[:8]
 }
 
 func extractText(msg ilink.WeixinMessage) string {
