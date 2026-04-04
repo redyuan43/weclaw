@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/fastclaw-ai/weclaw/controlplane"
 	"github.com/fastclaw-ai/weclaw/ilink"
@@ -21,6 +22,7 @@ type Server struct {
 	inbox         *messaging.InboxStore
 	handler       *messaging.Handler
 	userAgents    *controlplane.Service
+	debugInject   func(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage)
 }
 
 // NewServer creates an API server.
@@ -46,6 +48,10 @@ func (s *Server) SetUserAgents(service *controlplane.Service) {
 	s.userAgents = service
 }
 
+func (s *Server) SetDebugMessageInjector(fn func(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage)) {
+	s.debugInject = fn
+}
+
 // SendRequest is the JSON body for POST /api/send.
 type SendRequest struct {
 	AccountID string `json:"account_id,omitempty"`
@@ -60,12 +66,22 @@ type AgentChatRequest struct {
 	AgentName      string `json:"agent_name,omitempty"`
 }
 
+type DebugInboundRequest struct {
+	AccountID    string `json:"account_id"`
+	FromUserID   string `json:"from_user_id"`
+	Text         string `json:"text"`
+	ContextToken string `json:"context_token,omitempty"`
+	MessageID    int64  `json:"message_id,omitempty"`
+	Mode         string `json:"mode,omitempty"` // text | voice
+}
+
 // Run starts the HTTP server. Blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/send", s.handleSend)
 	mux.HandleFunc("/api/agent/chat", s.handleAgentChat)
 	mux.HandleFunc("/api/bridge/inbound", s.handleBridgeInbound)
+	mux.HandleFunc("/api/debug/inbound", s.handleDebugInbound)
 	mux.HandleFunc("/api/inbox", s.handleInbox)
 	mux.HandleFunc("/api/inbox/clear", s.handleClearInbox)
 	mux.HandleFunc("/.well-known/agent-card.json", s.handleWellKnownAgentCard)
@@ -219,6 +235,94 @@ func (s *Server) handleBridgeInbound(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
+}
+
+func (s *Server) handleDebugInbound(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.handler == nil && s.debugInject == nil {
+		http.Error(w, "message handler unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req DebugInboundRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.AccountID == "" {
+		http.Error(w, `"account_id" is required`, http.StatusBadRequest)
+		return
+	}
+	if req.FromUserID == "" {
+		http.Error(w, `"from_user_id" is required`, http.StatusBadRequest)
+		return
+	}
+	if req.Text == "" {
+		http.Error(w, `"text" is required`, http.StatusBadRequest)
+		return
+	}
+
+	client, err := s.selectClient(req.AccountID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	mode := req.Mode
+	if mode == "" {
+		mode = "text"
+	}
+	var item ilink.MessageItem
+	switch mode {
+	case "text":
+		item = ilink.MessageItem{
+			Type:     ilink.ItemTypeText,
+			TextItem: &ilink.TextItem{Text: req.Text},
+		}
+	case "voice":
+		item = ilink.MessageItem{
+			Type: ilink.ItemTypeVoice,
+			VoiceItem: &ilink.VoiceItem{
+				Text: req.Text,
+			},
+		}
+	default:
+		http.Error(w, `"mode" must be "text" or "voice"`, http.StatusBadRequest)
+		return
+	}
+
+	messageID := req.MessageID
+	if messageID == 0 {
+		messageID = time.Now().UnixNano()
+	}
+	msg := ilink.WeixinMessage{
+		MessageID:    messageID,
+		FromUserID:   req.FromUserID,
+		ToUserID:     client.BotID(),
+		MessageType:  ilink.MessageTypeUser,
+		MessageState: ilink.MessageStateFinish,
+		ItemList:     []ilink.MessageItem{item},
+		ContextToken: req.ContextToken,
+	}
+
+	injector := s.debugInject
+	if injector == nil {
+		injector = s.handler.HandleMessage
+	}
+	injector(r.Context(), client, msg)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":       "ok",
+		"account_id":   req.AccountID,
+		"from_user_id": req.FromUserID,
+		"message_id":   messageID,
+		"mode":         mode,
+		"to_user_id":   client.BotID(),
+	})
 }
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {

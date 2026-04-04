@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/agent"
+	"github.com/fastclaw-ai/weclaw/ilink"
 	"github.com/fastclaw-ai/weclaw/messaging"
 )
 
@@ -157,5 +158,54 @@ func TestHandleBridgeInbound(t *testing.T) {
 	}
 	if sentTo != "local-user@im.wechat" || sentText != "peer ok" {
 		t.Fatalf("unexpected local send: to=%q text=%q", sentTo, sentText)
+	}
+}
+
+func TestHandleDebugInbound(t *testing.T) {
+	creds := &ilink.Credentials{
+		ILinkBotID: "acct-a@im.bot",
+		BotToken:   "test-token",
+		BaseURL:    "http://127.0.0.1",
+	}
+	client := ilink.NewClient(creds)
+	server := NewServer([]*ilink.Client{client}, "", nil, nil)
+
+	var injected ilink.WeixinMessage
+	server.SetDebugMessageInjector(func(_ context.Context, gotClient *ilink.Client, msg ilink.WeixinMessage) {
+		if gotClient.BotID() != "acct-a@im.bot" {
+			t.Fatalf("client bot id = %q, want acct-a@im.bot", gotClient.BotID())
+		}
+		injected = msg
+	})
+
+	raw := []byte(`{
+	  "account_id":"acct-a@im.bot",
+	  "from_user_id":"owner-a@im.wechat",
+	  "text":"请帮我测试这条调试消息",
+	  "mode":"voice",
+	  "context_token":"ctx-debug"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/debug/inbound", bytes.NewReader(raw))
+	rec := httptest.NewRecorder()
+
+	server.handleDebugInbound(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if injected.FromUserID != "owner-a@im.wechat" {
+		t.Fatalf("injected.FromUserID = %q, want owner-a@im.wechat", injected.FromUserID)
+	}
+	if injected.ToUserID != "acct-a@im.bot" {
+		t.Fatalf("injected.ToUserID = %q, want acct-a@im.bot", injected.ToUserID)
+	}
+	if injected.MessageType != ilink.MessageTypeUser || injected.MessageState != ilink.MessageStateFinish {
+		t.Fatalf("unexpected message envelope: %#v", injected)
+	}
+	if len(injected.ItemList) != 1 || injected.ItemList[0].Type != ilink.ItemTypeVoice || injected.ItemList[0].VoiceItem == nil {
+		t.Fatalf("unexpected item list: %#v", injected.ItemList)
+	}
+	if injected.ItemList[0].VoiceItem.Text != "请帮我测试这条调试消息" {
+		t.Fatalf("voice text = %q", injected.ItemList[0].VoiceItem.Text)
 	}
 }
