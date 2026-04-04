@@ -126,6 +126,24 @@ type BridgeTask struct {
 	UpdatedAt       string               `json:"updated_at"`
 }
 
+func (t *BridgeTask) clone() *BridgeTask {
+	if t == nil {
+		return nil
+	}
+	clone := *t
+	if t.Metadata != nil {
+		clone.Metadata = make(map[string]string, len(t.Metadata))
+		for k, v := range t.Metadata {
+			clone.Metadata[k] = v
+		}
+	}
+	if t.History != nil {
+		clone.History = make([]BridgeHistoryEntry, len(t.History))
+		copy(clone.History, t.History)
+	}
+	return &clone
+}
+
 const (
 	waitingScopeLocalUserFollowUp = "local_user_follow_up"
 	waitingScopePeerUserProxy     = "peer_user_proxy"
@@ -186,22 +204,23 @@ func (s *BridgeTaskStore) Save(task *BridgeTask) {
 	if task == nil {
 		return
 	}
+	stored := task.clone()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[task.TaskID] = task
-	if task.ReplyUserID != "" && task.Status == BridgeTaskWaitingLocalUser {
-		s.pendingByUser[task.ReplyUserID] = task.TaskID
+	s.tasks[stored.TaskID] = stored
+	if stored.ReplyUserID != "" && stored.Status == BridgeTaskWaitingLocalUser {
+		s.pendingByUser[stored.ReplyUserID] = stored.TaskID
 		return
 	}
-	if task.ReplyUserID != "" && s.pendingByUser[task.ReplyUserID] == task.TaskID {
-		delete(s.pendingByUser, task.ReplyUserID)
+	if stored.ReplyUserID != "" && s.pendingByUser[stored.ReplyUserID] == stored.TaskID {
+		delete(s.pendingByUser, stored.ReplyUserID)
 	}
 }
 
 func (s *BridgeTaskStore) Get(taskID string) *BridgeTask {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.tasks[taskID]
+	return s.tasks[taskID].clone()
 }
 
 func (s *BridgeTaskStore) PendingForUser(userID string) *BridgeTask {
@@ -211,7 +230,7 @@ func (s *BridgeTaskStore) PendingForUser(userID string) *BridgeTask {
 	if taskID == "" {
 		return nil
 	}
-	return s.tasks[taskID]
+	return s.tasks[taskID].clone()
 }
 
 func (r *BridgeRuntime) NormalizeIncomingText(text string) (string, bool) {

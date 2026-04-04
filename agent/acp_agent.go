@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -219,7 +220,7 @@ func (a *ACPAgent) Start(ctx context.Context) error {
 		return nil
 	}
 
-	a.cmd = exec.CommandContext(ctx, a.command, a.args...)
+	a.cmd = exec.CommandContext(ctx, a.command, a.startArgs()...)
 	a.cmd.Dir = a.cwd
 	if len(a.env) > 0 {
 		cmdEnv, err := mergeEnv(os.Environ(), a.env)
@@ -405,7 +406,7 @@ func (a *ACPAgent) Chat(ctx context.Context, conversationID string, message stri
 	go func() {
 		result, err := a.rpc(ctx, "session/prompt", promptParams{
 			SessionID: sessionID,
-			Prompt:    []promptEntry{{Type: "text", Text: message}},
+			Prompt:    a.legacyPromptEntries(message),
 		})
 		if result != nil {
 			log.Printf("[acp] prompt result (session=%s): %s", sessionID, string(result))
@@ -603,6 +604,26 @@ func (a *ACPAgent) chatCodexAppServer(ctx context.Context, conversationID string
 			}
 		}
 	}
+}
+
+func (a *ACPAgent) startArgs() []string {
+	args := append([]string(nil), a.args...)
+	if a.protocol != protocolCodexAppServer {
+		return args
+	}
+	if strings.TrimSpace(a.systemPrompt) == "" {
+		return args
+	}
+	return append(args, "-c", "developer_instructions="+strconv.Quote(a.systemPrompt))
+}
+
+func (a *ACPAgent) legacyPromptEntries(message string) []promptEntry {
+	entries := make([]promptEntry, 0, 2)
+	if strings.TrimSpace(a.systemPrompt) != "" {
+		entries = append(entries, promptEntry{Type: "text", Text: a.systemPrompt})
+	}
+	entries = append(entries, promptEntry{Type: "text", Text: message})
+	return entries
 }
 
 func (a *ACPAgent) rpc(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
