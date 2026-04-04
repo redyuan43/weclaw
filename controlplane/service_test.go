@@ -140,3 +140,29 @@ func TestDelegationApprovalFlow(t *testing.T) {
 	}
 	t.Fatalf("task did not complete, final state=%#v", parent)
 }
+
+func TestSubmitOwnerTaskAutoDelegatesByHeuristic(t *testing.T) {
+	store, service, sent := newTestService(t)
+
+	task, err := service.SubmitOwnerTask(context.Background(), "acct-a", "owner-a", "请账号B帮我完成这件事")
+	if err != nil {
+		t.Fatalf("submit owner task: %v", err)
+	}
+	if task.Status != TaskStatusWaitingApproval {
+		t.Fatalf("task.Status = %q, want %q", task.Status, TaskStatusWaitingApproval)
+	}
+	if task.TargetAccountID != "acct-b" {
+		t.Fatalf("task.TargetAccountID = %q, want acct-b", task.TargetAccountID)
+	}
+
+	grant, err := store.GetApproval(task.ApprovalID)
+	if err != nil {
+		t.Fatalf("get approval: %v", err)
+	}
+	if grant == nil || grant.Status != ApprovalStatusPending {
+		t.Fatalf("grant = %#v, want pending", grant)
+	}
+	if len(*sent) == 0 || (*sent)[0].accountID != "acct-b" {
+		t.Fatalf("expected approval notice to acct-b owner, sent=%#v", *sent)
+	}
+}

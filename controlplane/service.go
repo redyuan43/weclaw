@@ -256,6 +256,49 @@ func (s *Service) SubmitOwnerTask(ctx context.Context, accountID, requesterConta
 	if profile == nil {
 		return nil, fmt.Errorf("unknown account: %s", accountID)
 	}
+	text = strings.TrimSpace(text)
+
+	decision, err := s.decideOwnerTask(ctx, profile, requesterContactID, text)
+	if err == nil && decision.Action == "delegate" && decision.TargetAccountID != "" && decision.TargetAccountID != accountID {
+		task, _, createErr := s.CreateDelegation(
+			ctx,
+			accountID,
+			requesterContactID,
+			decision.TargetAccountID,
+			firstNonEmpty(decision.Message, text),
+		)
+		if createErr == nil {
+			_ = s.store.AppendTaskHistory(AppendHistoryInput{
+				TaskID:         task.ID,
+				Actor:          "system",
+				ActorAccountID: accountID,
+				Kind:           "auto-delegation-selected",
+				Message:        firstNonEmpty(decision.Rationale, "主 Agent 自动选择跨用户协作"),
+				Metadata: map[string]any{
+					"target_account_id": decision.TargetAccountID,
+				},
+			})
+			_ = s.store.AppendAudit(AppendAuditInput{
+				TaskID:    task.ID,
+				AccountID: accountID,
+				Category:  "auto-delegation-selected",
+				Message:   firstNonEmpty(decision.Rationale, "主 Agent 自动选择跨用户协作"),
+				Metadata: map[string]any{
+					"target_account_id": decision.TargetAccountID,
+				},
+			})
+			return task, nil
+		}
+		_ = s.store.AppendAudit(AppendAuditInput{
+			TaskID:    "",
+			AccountID: accountID,
+			Category:  "auto-delegation-fallback",
+			Message:   createErr.Error(),
+			Metadata: map[string]any{
+				"target_account_id": decision.TargetAccountID,
+			},
+		})
+	}
 
 	task, err := s.store.CreateTask(CreateTaskInput{
 		ID:                 uuid.NewString(),
@@ -294,6 +337,151 @@ func (s *Service) SubmitOwnerTask(ctx context.Context, accountID, requesterConta
 	})
 
 	return s.processLocalTask(ctx, profile, task, false)
+}
+
+func (s *Service) decideOwnerTask(ctx context.Context, profile *UserAgentProfile, requesterContactID, text string) (OwnerTaskDecision, error) {
+	decision, ok := s.heuristicOwnerTaskDecision(profile, text)
+	if ok {
+		return decision, nil
+	}
+	if s.chat == nil {
+		return OwnerTaskDecision{Action: "local", Message: text}, fmt.Errorf("route chat unavailable")
+	}
+
+	profiles, err := s.store.ListProfiles()
+	if err != nil {
+		return OwnerTaskDecision{Action: "local", Message: text}, err
+	}
+
+	var candidates []map[string]any
+	for _, candidate := range profiles {
+		if candidate.AccountID == profile.AccountID {
+			continue
+		}
+		bindings, bindingsErr := s.store.ListCapabilityBindings(candidate.AccountID)
+		if bindingsErr != nil {
+			return OwnerTaskDecision{Action: "local", Message: text}, bindingsErr
+		}
+		var capabilityNames []string
+		for _, binding := range bindings {
+			if binding.Enabled {
+				capabilityNames = append(capabilityNames, binding.Name)
+			}
+		}
+		candidates = append(candidates, map[string]any{
+			"account_id":   candidate.AccountID,
+			"display_name": candidate.DisplayName,
+			"description":  candidate.Description,
+			"capabilities": capabilityNames,
+		})
+	}
+	if len(candidates) == 0 {
+		return OwnerTaskDecision{Action: "local", Message: text}, nil
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"current_account": map[string]any{
+			"account_id":   profile.AccountID,
+			"display_name": profile.DisplayName,
+			"description":  profile.Description,
+		},
+		"requester_contact_id": requesterContactID,
+		"user_message":         text,
+		"candidate_agents":     candidates,
+	})
+	if err != nil {
+		return OwnerTaskDecision{Action: "local", Message: text}, err
+	}
+
+	prompt := "你是 WeClaw 多用户协作路由器。判断当前用户请求应该由本地主 Agent 直接处理，还是委派给另一个用户 Agent。\n" +
+		"只输出 JSON，不要输出其他文字。格式：{\"action\":\"local|delegate\",\"target_account_id\":\"\",\"message\":\"\",\"rationale\":\"\"}\n" +
+		"规则：\n" +
+		"- 只有在明确更适合由另一个用户 Agent 处理时，action 才能是 delegate。\n" +
+		"- 如果 delegate，target_account_id 必须是候选列表里的某个 account_id。\n" +
+		"- message 填写要发给对方 Agent 的任务文本；如果本地处理，则保持为空或复述原始请求。\n" +
+		"- 如果用户只是普通咨询、本地可完成、或目标不明确，则返回 local。\n" +
+		"- 如果用户显式提到某个候选 Agent 的 display_name/account_id，并要求对方处理，优先 delegate。\n\n" +
+		string(payload)
+
+	result, err := s.chat(ctx, fmt.Sprintf("owner-router:%s:%s", profile.AccountID, requesterContactID), prompt, profile.BaseAgentName)
+	if err != nil {
+		return OwnerTaskDecision{Action: "local", Message: text}, err
+	}
+
+	parsed, err := parseOwnerTaskDecision(result.Reply)
+	if err != nil {
+		return OwnerTaskDecision{Action: "local", Message: text}, err
+	}
+	if parsed.Action != "delegate" {
+		return OwnerTaskDecision{Action: "local", Message: text, Rationale: parsed.Rationale}, nil
+	}
+	if !s.IsKnownAccount(parsed.TargetAccountID) || parsed.TargetAccountID == profile.AccountID {
+		return OwnerTaskDecision{Action: "local", Message: text, Rationale: "自动委派目标无效，回退本地处理"}, nil
+	}
+	parsed.Message = firstNonEmpty(parsed.Message, text)
+	return parsed, nil
+}
+
+func (s *Service) heuristicOwnerTaskDecision(profile *UserAgentProfile, text string) (OwnerTaskDecision, bool) {
+	profiles, err := s.store.ListProfiles()
+	if err != nil {
+		return OwnerTaskDecision{}, false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	if normalized == "" {
+		return OwnerTaskDecision{}, false
+	}
+
+	intentWords := []string{"让", "请", "找", "委托", "转给", "交给", "协作", "帮我联系", "帮我找", "请他", "请她", "请ta", "delegate"}
+	hasIntent := false
+	for _, word := range intentWords {
+		if strings.Contains(normalized, strings.ToLower(word)) {
+			hasIntent = true
+			break
+		}
+	}
+	if !hasIntent {
+		return OwnerTaskDecision{}, false
+	}
+
+	for _, candidate := range profiles {
+		if candidate.AccountID == profile.AccountID {
+			continue
+		}
+		if strings.Contains(normalized, strings.ToLower(candidate.AccountID)) || strings.Contains(normalized, strings.ToLower(candidate.DisplayName)) {
+			return OwnerTaskDecision{
+				Action:          "delegate",
+				TargetAccountID: candidate.AccountID,
+				Message:         text,
+				Rationale:       fmt.Sprintf("命中显式目标 %s，自动进入跨用户协作", firstNonEmpty(candidate.DisplayName, candidate.AccountID)),
+			}, true
+		}
+	}
+	return OwnerTaskDecision{}, false
+}
+
+func parseOwnerTaskDecision(raw string) (OwnerTaskDecision, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return OwnerTaskDecision{}, fmt.Errorf("empty route decision")
+	}
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start >= 0 && end > start {
+		raw = raw[start : end+1]
+	}
+	var decision OwnerTaskDecision
+	if err := json.Unmarshal([]byte(raw), &decision); err != nil {
+		return OwnerTaskDecision{}, err
+	}
+	decision.Action = strings.TrimSpace(decision.Action)
+	decision.TargetAccountID = strings.TrimSpace(decision.TargetAccountID)
+	decision.Message = strings.TrimSpace(decision.Message)
+	decision.Rationale = strings.TrimSpace(decision.Rationale)
+	if decision.Action == "" {
+		decision.Action = "local"
+	}
+	return decision, nil
 }
 
 func (s *Service) CreateDelegation(ctx context.Context, sourceAccountID, requesterContactID, targetQuery, text string) (*TaskRecord, *AuthorizationGrant, error) {

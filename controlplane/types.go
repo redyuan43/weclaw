@@ -116,6 +116,13 @@ type ChatResult struct {
 	Model     string
 }
 
+type OwnerTaskDecision struct {
+	Action          string `json:"action"`
+	TargetAccountID string `json:"target_account_id,omitempty"`
+	Message         string `json:"message,omitempty"`
+	Rationale       string `json:"rationale,omitempty"`
+}
+
 type ChatFunc func(ctx context.Context, conversationID, message, agentName string) (ChatResult, error)
 
 type SendTextFunc func(ctx context.Context, accountID, toUserID, text, contextToken string) error
