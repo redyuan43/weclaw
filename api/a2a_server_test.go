@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/fastclaw-ai/weclaw/controlplane"
@@ -40,11 +41,12 @@ func newTestUserAgentService(t *testing.T) *controlplane.Service {
 		t.Fatalf("sync accounts: %v", err)
 	}
 	if err := service.UpdateProfile(controlplane.UpdateProfileInput{
-		AccountID:      "acct-a",
-		DisplayName:    "账号A",
-		Description:    "账号A主 Agent",
-		OwnerContactID: "owner-a",
-		BaseAgentName:  "codex",
+		AccountID:         "acct-a",
+		DisplayName:       "账号A",
+		Description:       "账号A主 Agent",
+		OwnerContactID:    "owner-a",
+		BaseAgentName:     "codex",
+		DelegationEnabled: true,
 	}); err != nil {
 		t.Fatalf("update profile: %v", err)
 	}
@@ -120,5 +122,45 @@ func TestHandleA2AMessageSend(t *testing.T) {
 	}
 	if len(task.Artifacts) == 0 || task.Artifacts[0].Parts[0].Text == "" {
 		t.Fatalf("task.Artifacts = %#v, want non-empty result", task.Artifacts)
+	}
+}
+
+func TestHandleConsoleRedirectsToAgents(t *testing.T) {
+	server := NewServer(nil, "127.0.0.1:18011", nil, nil)
+	server.SetUserAgents(newTestUserAgentService(t))
+
+	req := httptest.NewRequest(http.MethodGet, "/console", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleConsole(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != "/console/agents" {
+		t.Fatalf("Location = %q, want /console/agents", got)
+	}
+}
+
+func TestRenderTasksPageIncludesViewLinks(t *testing.T) {
+	service := newTestUserAgentService(t)
+	if _, err := service.SubmitOwnerTask(context.Background(), "acct-a", "owner-a", "请处理这个任务"); err != nil {
+		t.Fatalf("submit owner task: %v", err)
+	}
+
+	server := NewServer(nil, "127.0.0.1:18011", nil, nil)
+	server.SetUserAgents(service)
+
+	req := httptest.NewRequest(http.MethodGet, "/console/tasks", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleConsoleRoute(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "画布") || !strings.Contains(body, "列表") {
+		t.Fatalf("expected canvas/list links in tasks page, body=%s", body)
 	}
 }

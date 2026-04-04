@@ -20,13 +20,17 @@ const (
 )
 
 type UserAgentProfile struct {
-	AccountID      string
-	DisplayName    string
-	Description    string
-	OwnerContactID string
-	BaseAgentName  string
-	CreatedAt      string
-	UpdatedAt      string
+	AccountID              string
+	DisplayName            string
+	Description            string
+	OwnerContactID         string
+	BaseAgentName          string
+	SpecializationTags     []string
+	SpecializationExamples []string
+	SpecializationAvoid    []string
+	DelegationEnabled      bool
+	CreatedAt              string
+	UpdatedAt              string
 }
 
 type CapabilityDefinition struct {
@@ -38,6 +42,7 @@ type CapabilityDefinition struct {
 	RiskLevel             string
 	RequiresAuthorization bool
 	ImplementationHint    string
+	RoutingTags           []string
 }
 
 type CapabilityBinding struct {
@@ -51,6 +56,7 @@ type CapabilityBinding struct {
 	ImplementationHint    string
 	InputModes            []string
 	OutputModes           []string
+	RoutingTags           []string
 }
 
 type TaskHistoryEntry struct {
@@ -136,11 +142,48 @@ type StoreSnapshot struct {
 }
 
 type UpdateProfileInput struct {
-	AccountID      string
-	DisplayName    string
-	Description    string
-	OwnerContactID string
-	BaseAgentName  string
+	AccountID              string
+	DisplayName            string
+	Description            string
+	OwnerContactID         string
+	BaseAgentName          string
+	SpecializationTags     []string
+	SpecializationExamples []string
+	SpecializationAvoid    []string
+	DelegationEnabled      bool
+}
+
+type WorkflowGraph struct {
+	TaskID        string         `json:"task_id"`
+	Title         string         `json:"title"`
+	Status        string         `json:"status"`
+	BlockedReason string         `json:"blocked_reason,omitempty"`
+	Nodes         []WorkflowNode `json:"nodes"`
+	Edges         []WorkflowEdge `json:"edges"`
+}
+
+type WorkflowNode struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Type   string `json:"type"`
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+	Order  int    `json:"order"`
+}
+
+type WorkflowEdge struct {
+	From  string `json:"from"`
+	To    string `json:"to"`
+	Label string `json:"label,omitempty"`
+}
+
+type TaskDetail struct {
+	Task     *TaskRecord
+	Parent   *TaskRecord
+	Children []TaskRecord
+	Approval *AuthorizationGrant
+	Audit    []AuditRecord
+	Workflow *WorkflowGraph
 }
 
 func nowString() string {

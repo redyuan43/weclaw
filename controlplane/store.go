@@ -63,6 +63,7 @@ var defaultCapabilities = []CapabilityDefinition{
 		RiskLevel:             "low",
 		RequiresAuthorization: false,
 		ImplementationHint:    "weclaw-handler",
+		RoutingTags:           []string{"任务", "需求", "请求"},
 	},
 	{
 		ID:                    "local-agent-execution",
@@ -73,6 +74,7 @@ var defaultCapabilities = []CapabilityDefinition{
 		RiskLevel:             "medium",
 		RequiresAuthorization: false,
 		ImplementationHint:    "configured-base-agent",
+		RoutingTags:           []string{"代码", "编程", "实现", "重构", "调试", "文档", "总结", "分析"},
 	},
 	{
 		ID:                    "cross-user-task-delegation",
@@ -83,6 +85,7 @@ var defaultCapabilities = []CapabilityDefinition{
 		RiskLevel:             "high",
 		RequiresAuthorization: true,
 		ImplementationHint:    "a2a-task-delegation",
+		RoutingTags:           []string{"协作", "委派", "转给", "交给", "请", "帮我找"},
 	},
 	{
 		ID:                    "wechat-notification-delivery",
@@ -93,6 +96,7 @@ var defaultCapabilities = []CapabilityDefinition{
 		RiskLevel:             "medium",
 		RequiresAuthorization: false,
 		ImplementationHint:    "ilink-send-text",
+		RoutingTags:           []string{"通知", "提醒", "发消息"},
 	},
 	{
 		ID:                    "task-supervision-and-audit",
@@ -103,6 +107,7 @@ var defaultCapabilities = []CapabilityDefinition{
 		RiskLevel:             "low",
 		RequiresAuthorization: false,
 		ImplementationHint:    "console-audit-log",
+		RoutingTags:           []string{"日志", "流程", "审计", "追踪", "工作流"},
 	},
 	{
 		ID:                    "agent-card-publishing",
@@ -113,6 +118,7 @@ var defaultCapabilities = []CapabilityDefinition{
 		RiskLevel:             "low",
 		RequiresAuthorization: false,
 		ImplementationHint:    "a2a-agent-card",
+		RoutingTags:           []string{"A2A", "Agent Card", "发布"},
 	},
 }
 
@@ -169,6 +175,10 @@ func (s *Store) init() error {
 			description TEXT NOT NULL,
 			owner_contact_id TEXT NOT NULL DEFAULT '',
 			base_agent_name TEXT NOT NULL,
+			specialization_tags_json TEXT NOT NULL DEFAULT '[]',
+			specialization_examples_json TEXT NOT NULL DEFAULT '[]',
+			specialization_avoid_json TEXT NOT NULL DEFAULT '[]',
+			delegation_enabled INTEGER NOT NULL DEFAULT 1,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);`,
@@ -180,7 +190,8 @@ func (s *Store) init() error {
 			output_modes_json TEXT NOT NULL,
 			risk_level TEXT NOT NULL,
 			requires_authorization INTEGER NOT NULL,
-			implementation_hint TEXT NOT NULL
+			implementation_hint TEXT NOT NULL,
+			routing_tags_json TEXT NOT NULL DEFAULT '[]'
 		);`,
 		`CREATE TABLE IF NOT EXISTS capability_bindings (
 			account_id TEXT NOT NULL,
@@ -247,6 +258,21 @@ func (s *Store) init() error {
 			return err
 		}
 	}
+	if err := s.ensureColumn("user_agents", "specialization_tags_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("user_agents", "specialization_examples_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("user_agents", "specialization_avoid_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("user_agents", "delegation_enabled", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("capabilities", "routing_tags_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
 	return s.seedCapabilities()
 }
 
@@ -260,9 +286,13 @@ func (s *Store) seedCapabilities() error {
 		if err != nil {
 			return err
 		}
+		routingTags, err := marshalJSON(capability.RoutingTags)
+		if err != nil {
+			return err
+		}
 		if _, err := s.db.Exec(
-			`INSERT INTO capabilities (id, name, description, input_modes_json, output_modes_json, risk_level, requires_authorization, implementation_hint)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO capabilities (id, name, description, input_modes_json, output_modes_json, risk_level, requires_authorization, implementation_hint, routing_tags_json)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(id) DO UPDATE SET
 			   name = excluded.name,
 			   description = excluded.description,
@@ -270,7 +300,8 @@ func (s *Store) seedCapabilities() error {
 			   output_modes_json = excluded.output_modes_json,
 			   risk_level = excluded.risk_level,
 			   requires_authorization = excluded.requires_authorization,
-			   implementation_hint = excluded.implementation_hint`,
+			   implementation_hint = excluded.implementation_hint,
+			   routing_tags_json = excluded.routing_tags_json`,
 			capability.ID,
 			capability.Name,
 			capability.Description,
@@ -279,6 +310,7 @@ func (s *Store) seedCapabilities() error {
 			capability.RiskLevel,
 			boolToInt(capability.RequiresAuthorization),
 			capability.ImplementationHint,
+			routingTags,
 		); err != nil {
 			return err
 		}
@@ -309,9 +341,14 @@ func (s *Store) SyncAccounts(accountOwners map[string]string, defaultAgent strin
 	for _, accountID := range trimmed {
 		displayName := accountID
 		ownerContactID := strings.TrimSpace(accountOwners[accountID])
+		emptyJSON := "[]"
 		if _, err := s.db.Exec(
-			`INSERT INTO user_agents (account_id, display_name, description, owner_contact_id, base_agent_name, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO user_agents (
+				account_id, display_name, description, owner_contact_id, base_agent_name,
+				specialization_tags_json, specialization_examples_json, specialization_avoid_json, delegation_enabled,
+				created_at, updated_at
+			)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
 			 ON CONFLICT(account_id) DO UPDATE SET
 			   display_name = CASE WHEN user_agents.display_name = '' THEN excluded.display_name ELSE user_agents.display_name END,
 			   description = CASE WHEN user_agents.description = '' THEN excluded.description ELSE user_agents.description END,
@@ -323,6 +360,9 @@ func (s *Store) SyncAccounts(accountOwners map[string]string, defaultAgent strin
 			"用户主 Agent",
 			ownerContactID,
 			defaultAgent,
+			emptyJSON,
+			emptyJSON,
+			emptyJSON,
 			now,
 			now,
 		); err != nil {
@@ -345,7 +385,9 @@ func (s *Store) SyncAccounts(accountOwners map[string]string, defaultAgent strin
 
 func (s *Store) ListProfiles() ([]UserAgentProfile, error) {
 	rows, err := s.db.Query(
-		`SELECT account_id, display_name, description, owner_contact_id, base_agent_name, created_at, updated_at
+		`SELECT account_id, display_name, description, owner_contact_id, base_agent_name,
+		        specialization_tags_json, specialization_examples_json, specialization_avoid_json, delegation_enabled,
+		        created_at, updated_at
 		 FROM user_agents
 		 ORDER BY account_id`,
 	)
@@ -356,27 +398,55 @@ func (s *Store) ListProfiles() ([]UserAgentProfile, error) {
 
 	var profiles []UserAgentProfile
 	for rows.Next() {
-		var profile UserAgentProfile
+		var (
+			profile           UserAgentProfile
+			tagsJSON          string
+			examplesJSON      string
+			avoidJSON         string
+			delegationEnabled int
+		)
 		if err := rows.Scan(
 			&profile.AccountID,
 			&profile.DisplayName,
 			&profile.Description,
 			&profile.OwnerContactID,
 			&profile.BaseAgentName,
+			&tagsJSON,
+			&examplesJSON,
+			&avoidJSON,
+			&delegationEnabled,
 			&profile.CreatedAt,
 			&profile.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
+		if err := json.Unmarshal([]byte(tagsJSON), &profile.SpecializationTags); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(examplesJSON), &profile.SpecializationExamples); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(avoidJSON), &profile.SpecializationAvoid); err != nil {
+			return nil, err
+		}
+		profile.DelegationEnabled = delegationEnabled == 1
 		profiles = append(profiles, profile)
 	}
 	return profiles, rows.Err()
 }
 
 func (s *Store) GetProfile(accountID string) (*UserAgentProfile, error) {
-	var profile UserAgentProfile
+	var (
+		profile           UserAgentProfile
+		tagsJSON          string
+		examplesJSON      string
+		avoidJSON         string
+		delegationEnabled int
+	)
 	err := s.db.QueryRow(
-		`SELECT account_id, display_name, description, owner_contact_id, base_agent_name, created_at, updated_at
+		`SELECT account_id, display_name, description, owner_contact_id, base_agent_name,
+		        specialization_tags_json, specialization_examples_json, specialization_avoid_json, delegation_enabled,
+		        created_at, updated_at
 		 FROM user_agents WHERE account_id = ?`,
 		accountID,
 	).Scan(
@@ -385,6 +455,10 @@ func (s *Store) GetProfile(accountID string) (*UserAgentProfile, error) {
 		&profile.Description,
 		&profile.OwnerContactID,
 		&profile.BaseAgentName,
+		&tagsJSON,
+		&examplesJSON,
+		&avoidJSON,
+		&delegationEnabled,
 		&profile.CreatedAt,
 		&profile.UpdatedAt,
 	)
@@ -394,18 +468,46 @@ func (s *Store) GetProfile(accountID string) (*UserAgentProfile, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := json.Unmarshal([]byte(tagsJSON), &profile.SpecializationTags); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(examplesJSON), &profile.SpecializationExamples); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(avoidJSON), &profile.SpecializationAvoid); err != nil {
+		return nil, err
+	}
+	profile.DelegationEnabled = delegationEnabled == 1
 	return &profile, nil
 }
 
 func (s *Store) UpdateProfile(input UpdateProfileInput) error {
-	_, err := s.db.Exec(
+	tagsJSON, err := marshalJSON(input.SpecializationTags)
+	if err != nil {
+		return err
+	}
+	examplesJSON, err := marshalJSON(input.SpecializationExamples)
+	if err != nil {
+		return err
+	}
+	avoidJSON, err := marshalJSON(input.SpecializationAvoid)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
 		`UPDATE user_agents
-		 SET display_name = ?, description = ?, owner_contact_id = ?, base_agent_name = ?, updated_at = ?
+		 SET display_name = ?, description = ?, owner_contact_id = ?, base_agent_name = ?,
+		     specialization_tags_json = ?, specialization_examples_json = ?, specialization_avoid_json = ?,
+		     delegation_enabled = ?, updated_at = ?
 		 WHERE account_id = ?`,
 		strings.TrimSpace(input.DisplayName),
 		strings.TrimSpace(input.Description),
 		strings.TrimSpace(input.OwnerContactID),
 		strings.TrimSpace(input.BaseAgentName),
+		tagsJSON,
+		examplesJSON,
+		avoidJSON,
+		boolToInt(input.DelegationEnabled),
 		nowString(),
 		input.AccountID,
 	)
@@ -414,7 +516,7 @@ func (s *Store) UpdateProfile(input UpdateProfileInput) error {
 
 func (s *Store) ListCapabilities() ([]CapabilityDefinition, error) {
 	rows, err := s.db.Query(
-		`SELECT id, name, description, input_modes_json, output_modes_json, risk_level, requires_authorization, implementation_hint
+		`SELECT id, name, description, input_modes_json, output_modes_json, risk_level, requires_authorization, implementation_hint, routing_tags_json
 		 FROM capabilities
 		 ORDER BY id`,
 	)
@@ -429,6 +531,7 @@ func (s *Store) ListCapabilities() ([]CapabilityDefinition, error) {
 			capability   CapabilityDefinition
 			inputModes   string
 			outputModes  string
+			routingTags  string
 			requiresAuth int
 		)
 		if err := rows.Scan(
@@ -440,6 +543,7 @@ func (s *Store) ListCapabilities() ([]CapabilityDefinition, error) {
 			&capability.RiskLevel,
 			&requiresAuth,
 			&capability.ImplementationHint,
+			&routingTags,
 		); err != nil {
 			return nil, err
 		}
@@ -447,6 +551,9 @@ func (s *Store) ListCapabilities() ([]CapabilityDefinition, error) {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(outputModes), &capability.OutputModes); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(routingTags), &capability.RoutingTags); err != nil {
 			return nil, err
 		}
 		capability.RequiresAuthorization = requiresAuth == 1
@@ -457,7 +564,7 @@ func (s *Store) ListCapabilities() ([]CapabilityDefinition, error) {
 
 func (s *Store) ListCapabilityBindings(accountID string) ([]CapabilityBinding, error) {
 	rows, err := s.db.Query(
-		`SELECT b.account_id, b.capability_id, b.enabled, c.name, c.description, c.risk_level, c.requires_authorization, c.implementation_hint, c.input_modes_json, c.output_modes_json
+		`SELECT b.account_id, b.capability_id, b.enabled, c.name, c.description, c.risk_level, c.requires_authorization, c.implementation_hint, c.input_modes_json, c.output_modes_json, c.routing_tags_json
 		 FROM capability_bindings b
 		 JOIN capabilities c ON c.id = b.capability_id
 		 WHERE b.account_id = ?
@@ -477,6 +584,7 @@ func (s *Store) ListCapabilityBindings(accountID string) ([]CapabilityBinding, e
 			requiresAuth int
 			inputModes   string
 			outputModes  string
+			routingTags  string
 		)
 		if err := rows.Scan(
 			&binding.AccountID,
@@ -489,6 +597,7 @@ func (s *Store) ListCapabilityBindings(accountID string) ([]CapabilityBinding, e
 			&binding.ImplementationHint,
 			&inputModes,
 			&outputModes,
+			&routingTags,
 		); err != nil {
 			return nil, err
 		}
@@ -496,6 +605,9 @@ func (s *Store) ListCapabilityBindings(accountID string) ([]CapabilityBinding, e
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(outputModes), &binding.OutputModes); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(routingTags), &binding.RoutingTags); err != nil {
 			return nil, err
 		}
 		binding.Enabled = enabled == 1
@@ -676,6 +788,60 @@ func (s *Store) ListTasks(limit int) ([]TaskRecord, error) {
 		 ORDER BY updated_at DESC
 		 LIMIT ?`,
 		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []TaskRecord
+	for rows.Next() {
+		var (
+			task         TaskRecord
+			blocking     int
+			metadataJSON string
+		)
+		if err := rows.Scan(
+			&task.ID,
+			&task.ContextID,
+			&task.RequesterAccountID,
+			&task.RequesterContactID,
+			&task.TargetAccountID,
+			&task.OwnerAccountID,
+			&task.Status,
+			&task.TaskKind,
+			&task.Title,
+			&task.RequestText,
+			&task.ResultText,
+			&task.ErrorText,
+			&task.ParentTaskID,
+			&task.AssignedAgentName,
+			&task.ApprovalID,
+			&blocking,
+			&metadataJSON,
+			&task.CreatedAt,
+			&task.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		task.Blocking = blocking == 1
+		if err := json.Unmarshal([]byte(metadataJSON), &task.Metadata); err != nil {
+			return nil, err
+		}
+		result = append(result, task)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) ListChildTasks(parentTaskID string) ([]TaskRecord, error) {
+	rows, err := s.db.Query(
+		`SELECT id, context_id, requester_account_id, requester_contact_id, target_account_id, owner_account_id,
+		        status, task_kind, title, request_text, result_text, error_text, parent_task_id,
+		        assigned_agent_name, approval_id, blocking, metadata_json, created_at, updated_at
+		 FROM a2a_tasks
+		 WHERE parent_task_id = ?
+		 ORDER BY created_at ASC`,
+		parentTaskID,
 	)
 	if err != nil {
 		return nil, err
@@ -947,10 +1113,84 @@ func (s *Store) ListAudit(limit int) ([]AuditRecord, error) {
 	return result, rows.Err()
 }
 
-func marshalJSON(value any) (string, error) {
-	if value == nil {
-		return "{}", nil
+func (s *Store) ListTaskAudit(taskID string, limit int) ([]AuditRecord, error) {
+	if limit <= 0 {
+		limit = 100
 	}
+	rows, err := s.db.Query(
+		`SELECT id, task_id, account_id, category, message, metadata_json, created_at
+		 FROM audit_log
+		 WHERE task_id = ?
+		 ORDER BY id DESC
+		 LIMIT ?`,
+		taskID,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []AuditRecord
+	for rows.Next() {
+		var (
+			record       AuditRecord
+			metadataJSON string
+		)
+		if err := rows.Scan(
+			&record.ID,
+			&record.TaskID,
+			&record.AccountID,
+			&record.Category,
+			&record.Message,
+			&metadataJSON,
+			&record.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(metadataJSON), &record.Metadata); err != nil {
+			return nil, err
+		}
+		result = append(result, record)
+	}
+	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+		result[i], result[j] = result[j], result[i]
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) ensureColumn(tableName, columnName, definition string) error {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &pk); err != nil {
+			return err
+		}
+		if name == columnName {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, definition))
+	return err
+}
+
+func marshalJSON(value any) (string, error) {
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return "", err

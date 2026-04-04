@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -180,6 +181,12 @@ func (s *Service) BuildAgentCard(accountID string) (*AgentCard, error) {
 			PushNotifications:      false,
 			StateTransitionHistory: true,
 		},
+		Metadata: map[string]any{
+			"specializationTags":     profile.SpecializationTags,
+			"specializationExamples": profile.SpecializationExamples,
+			"specializationAvoid":    profile.SpecializationAvoid,
+			"delegationEnabled":      profile.DelegationEnabled,
+		},
 	}
 
 	for _, binding := range bindings {
@@ -246,6 +253,85 @@ func (s *Service) Snapshot() (*StoreSnapshot, error) {
 		Approvals: approvals,
 		Audit:     audit,
 	}, nil
+}
+
+func (s *Service) GetTask(taskID string, historyLimit int) (*TaskRecord, error) {
+	return s.store.GetTask(taskID, historyLimit)
+}
+
+func (s *Service) GetTaskDetail(taskID string, historyLimit int) (*TaskDetail, error) {
+	task, err := s.store.GetTask(taskID, historyLimit)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil {
+		return nil, nil
+	}
+
+	var parent *TaskRecord
+	if task.ParentTaskID != "" {
+		parent, err = s.store.GetTask(task.ParentTaskID, historyLimit)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	children, err := s.store.ListChildTasks(task.ID)
+	if err != nil {
+		return nil, err
+	}
+	approval, err := s.GetApproval(task.ApprovalID)
+	if err != nil {
+		return nil, err
+	}
+	audit, err := s.store.ListTaskAudit(task.ID, 100)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TaskDetail{
+		Task:     task,
+		Parent:   parent,
+		Children: children,
+		Approval: approval,
+		Audit:    audit,
+		Workflow: buildWorkflowGraph(task, approval, children),
+	}, nil
+}
+
+func (s *Service) GetApproval(approvalID string) (*AuthorizationGrant, error) {
+	if strings.TrimSpace(approvalID) == "" {
+		return nil, nil
+	}
+	return s.store.GetApproval(approvalID)
+}
+
+func (s *Service) FormatTaskReply(task *TaskRecord) string {
+	if task == nil {
+		return ""
+	}
+	if strings.TrimSpace(task.ResultText) != "" {
+		return task.ResultText
+	}
+	switch task.Status {
+	case TaskStatusWaitingApproval:
+		targetLabel := task.TargetAccountID
+		if profile, err := s.store.GetProfile(task.TargetAccountID); err == nil && profile != nil {
+			targetLabel = firstNonEmpty(profile.DisplayName, profile.AccountID)
+		}
+		if task.ApprovalID != "" {
+			return fmt.Sprintf("已自动发起协作，正在等待 %s 批准。\n授权编号：%s", targetLabel, task.ApprovalID)
+		}
+		return fmt.Sprintf("已自动发起协作，正在等待 %s 批准。", targetLabel)
+	case TaskStatusRejected:
+		return firstNonEmpty(task.ErrorText, "协作任务已被拒绝")
+	case TaskStatusFailed:
+		return firstNonEmpty(task.ErrorText, "任务失败")
+	case TaskStatusWorking:
+		return "任务正在处理中。"
+	default:
+		return firstNonEmpty(task.ErrorText, task.RequestText)
+	}
 }
 
 func (s *Service) SubmitOwnerTask(ctx context.Context, accountID, requesterContactID, text string) (*TaskRecord, error) {
@@ -335,6 +421,21 @@ func (s *Service) SubmitOwnerTask(ctx context.Context, accountID, requesterConta
 			"requester_contact_id": requesterContactID,
 		},
 	})
+	if decision.Action == "local" && strings.TrimSpace(decision.Rationale) != "" {
+		_ = s.store.AppendTaskHistory(AppendHistoryInput{
+			TaskID:         task.ID,
+			Actor:          "system",
+			ActorAccountID: accountID,
+			Kind:           "auto-delegation-local-fallback",
+			Message:        decision.Rationale,
+		})
+		_ = s.store.AppendAudit(AppendAuditInput{
+			TaskID:    task.ID,
+			AccountID: accountID,
+			Category:  decisionAuditCategory(decision.Rationale),
+			Message:   decision.Rationale,
+		})
+	}
 
 	return s.processLocalTask(ctx, profile, task, false)
 }
@@ -344,82 +445,35 @@ func (s *Service) decideOwnerTask(ctx context.Context, profile *UserAgentProfile
 	if ok {
 		return decision, nil
 	}
-	if s.chat == nil {
-		return OwnerTaskDecision{Action: "local", Message: text}, fmt.Errorf("route chat unavailable")
-	}
-
-	profiles, err := s.store.ListProfiles()
+	scores, err := s.scoreOwnerTaskCandidates(profile, text)
 	if err != nil {
 		return OwnerTaskDecision{Action: "local", Message: text}, err
 	}
-
-	var candidates []map[string]any
-	for _, candidate := range profiles {
-		if candidate.AccountID == profile.AccountID {
-			continue
-		}
-		bindings, bindingsErr := s.store.ListCapabilityBindings(candidate.AccountID)
-		if bindingsErr != nil {
-			return OwnerTaskDecision{Action: "local", Message: text}, bindingsErr
-		}
-		var capabilityNames []string
-		for _, binding := range bindings {
-			if binding.Enabled {
-				capabilityNames = append(capabilityNames, binding.Name)
-			}
-		}
-		candidates = append(candidates, map[string]any{
-			"account_id":   candidate.AccountID,
-			"display_name": candidate.DisplayName,
-			"description":  candidate.Description,
-			"capabilities": capabilityNames,
-		})
-	}
-	if len(candidates) == 0 {
-		return OwnerTaskDecision{Action: "local", Message: text}, nil
+	if len(scores) == 0 {
+		return OwnerTaskDecision{Action: "local", Message: text, Rationale: "没有可用的其他 Agent 专长画像，回退本地处理"}, nil
 	}
 
-	payload, err := json.Marshal(map[string]any{
-		"current_account": map[string]any{
-			"account_id":   profile.AccountID,
-			"display_name": profile.DisplayName,
-			"description":  profile.Description,
-		},
-		"requester_contact_id": requesterContactID,
-		"user_message":         text,
-		"candidate_agents":     candidates,
-	})
-	if err != nil {
-		return OwnerTaskDecision{Action: "local", Message: text}, err
+	top := scores[0]
+	if top.Disqualified {
+		return OwnerTaskDecision{Action: "local", Message: text, Rationale: fmt.Sprintf("%s 命中禁做事项，回退本地处理", top.DisplayName)}, nil
+	}
+	if top.Score < 4 {
+		return OwnerTaskDecision{Action: "local", Message: text, Rationale: "专长匹配分不足，回退本地处理"}, nil
+	}
+	if len(scores) > 1 && top.Score-scores[1].Score < 2 {
+		return OwnerTaskDecision{Action: "local", Message: text, Rationale: "多个候选 Agent 匹配度过于接近，回退本地处理"}, nil
 	}
 
-	prompt := "你是 WeClaw 多用户协作路由器。判断当前用户请求应该由本地主 Agent 直接处理，还是委派给另一个用户 Agent。\n" +
-		"只输出 JSON，不要输出其他文字。格式：{\"action\":\"local|delegate\",\"target_account_id\":\"\",\"message\":\"\",\"rationale\":\"\"}\n" +
-		"规则：\n" +
-		"- 只有在明确更适合由另一个用户 Agent 处理时，action 才能是 delegate。\n" +
-		"- 如果 delegate，target_account_id 必须是候选列表里的某个 account_id。\n" +
-		"- message 填写要发给对方 Agent 的任务文本；如果本地处理，则保持为空或复述原始请求。\n" +
-		"- 如果用户只是普通咨询、本地可完成、或目标不明确，则返回 local。\n" +
-		"- 如果用户显式提到某个候选 Agent 的 display_name/account_id，并要求对方处理，优先 delegate。\n\n" +
-		string(payload)
-
-	result, err := s.chat(ctx, fmt.Sprintf("owner-router:%s:%s", profile.AccountID, requesterContactID), prompt, profile.BaseAgentName)
-	if err != nil {
-		return OwnerTaskDecision{Action: "local", Message: text}, err
+	reason := fmt.Sprintf("根据专长画像与能力标签，%s 匹配分最高（%d 分）", top.DisplayName, top.Score)
+	if len(top.Reasons) > 0 {
+		reason += "，命中：" + strings.Join(top.Reasons, "、")
 	}
-
-	parsed, err := parseOwnerTaskDecision(result.Reply)
-	if err != nil {
-		return OwnerTaskDecision{Action: "local", Message: text}, err
-	}
-	if parsed.Action != "delegate" {
-		return OwnerTaskDecision{Action: "local", Message: text, Rationale: parsed.Rationale}, nil
-	}
-	if !s.IsKnownAccount(parsed.TargetAccountID) || parsed.TargetAccountID == profile.AccountID {
-		return OwnerTaskDecision{Action: "local", Message: text, Rationale: "自动委派目标无效，回退本地处理"}, nil
-	}
-	parsed.Message = firstNonEmpty(parsed.Message, text)
-	return parsed, nil
+	return OwnerTaskDecision{
+		Action:          "delegate",
+		TargetAccountID: top.AccountID,
+		Message:         text,
+		Rationale:       reason,
+	}, nil
 }
 
 func (s *Service) heuristicOwnerTaskDecision(profile *UserAgentProfile, text string) (OwnerTaskDecision, bool) {
@@ -446,6 +500,9 @@ func (s *Service) heuristicOwnerTaskDecision(profile *UserAgentProfile, text str
 
 	for _, candidate := range profiles {
 		if candidate.AccountID == profile.AccountID {
+			continue
+		}
+		if !candidate.DelegationEnabled {
 			continue
 		}
 		if strings.Contains(normalized, strings.ToLower(candidate.AccountID)) || strings.Contains(normalized, strings.ToLower(candidate.DisplayName)) {
@@ -482,6 +539,91 @@ func parseOwnerTaskDecision(raw string) (OwnerTaskDecision, error) {
 		decision.Action = "local"
 	}
 	return decision, nil
+}
+
+type routingScore struct {
+	AccountID    string
+	DisplayName  string
+	Score        int
+	Reasons      []string
+	Disqualified bool
+	Profile      UserAgentProfile
+}
+
+func (s *Service) scoreOwnerTaskCandidates(profile *UserAgentProfile, text string) ([]routingScore, error) {
+	profiles, err := s.store.ListProfiles()
+	if err != nil {
+		return nil, err
+	}
+	normalized := normalizeRoutingText(text)
+	if normalized == "" {
+		return nil, nil
+	}
+
+	scores := make([]routingScore, 0, len(profiles))
+	for _, candidate := range profiles {
+		if candidate.AccountID == profile.AccountID || !candidate.DelegationEnabled {
+			continue
+		}
+		score := routingScore{
+			AccountID:   candidate.AccountID,
+			DisplayName: firstNonEmpty(candidate.DisplayName, candidate.AccountID),
+			Profile:     candidate,
+		}
+
+		for _, avoid := range candidate.SpecializationAvoid {
+			if tokenMatch(normalized, avoid) {
+				score.Disqualified = true
+				score.Reasons = append(score.Reasons, "禁做:"+strings.TrimSpace(avoid))
+				break
+			}
+		}
+		if score.Disqualified {
+			scores = append(scores, score)
+			continue
+		}
+
+		for _, tag := range candidate.SpecializationTags {
+			if tokenMatch(normalized, tag) {
+				score.Score += 3
+				score.Reasons = append(score.Reasons, "专长:"+strings.TrimSpace(tag))
+			}
+		}
+		for _, example := range candidate.SpecializationExamples {
+			if tokenMatch(normalized, example) {
+				score.Score += 2
+				score.Reasons = append(score.Reasons, "案例:"+strings.TrimSpace(example))
+			}
+		}
+
+		bindings, bindingsErr := s.store.ListCapabilityBindings(candidate.AccountID)
+		if bindingsErr != nil {
+			return nil, bindingsErr
+		}
+		for _, binding := range bindings {
+			if !binding.Enabled {
+				continue
+			}
+			for _, tag := range binding.RoutingTags {
+				if tokenMatch(normalized, tag) {
+					score.Score++
+					score.Reasons = append(score.Reasons, "能力:"+strings.TrimSpace(tag))
+				}
+			}
+		}
+		scores = append(scores, score)
+	}
+
+	sort.Slice(scores, func(i, j int) bool {
+		if scores[i].Disqualified != scores[j].Disqualified {
+			return !scores[i].Disqualified
+		}
+		if scores[i].Score == scores[j].Score {
+			return scores[i].DisplayName < scores[j].DisplayName
+		}
+		return scores[i].Score > scores[j].Score
+	})
+	return scores, nil
 }
 
 func (s *Service) CreateDelegation(ctx context.Context, sourceAccountID, requesterContactID, targetQuery, text string) (*TaskRecord, *AuthorizationGrant, error) {
@@ -1071,6 +1213,66 @@ func (s *Service) taskToA2ATask(task *TaskRecord) *A2ATask {
 	return out
 }
 
+func buildWorkflowGraph(task *TaskRecord, approval *AuthorizationGrant, children []TaskRecord) *WorkflowGraph {
+	if task == nil {
+		return nil
+	}
+
+	graph := &WorkflowGraph{
+		TaskID: task.ID,
+		Title:  task.Title,
+		Status: task.Status,
+	}
+
+	addNode := func(id, label, nodeType, status, detail string) {
+		graph.Nodes = append(graph.Nodes, WorkflowNode{
+			ID:     id,
+			Label:  label,
+			Type:   nodeType,
+			Status: status,
+			Detail: detail,
+			Order:  len(graph.Nodes),
+		})
+		if len(graph.Nodes) > 1 {
+			prev := graph.Nodes[len(graph.Nodes)-2]
+			graph.Edges = append(graph.Edges, WorkflowEdge{From: prev.ID, To: id})
+		}
+	}
+
+	switch task.TaskKind {
+	case "delegated_execution":
+		addNode("intake", "收到委派", "intake", "completed", task.RequestText)
+		addNode("local_execution", "本地执行", "local_execution", executionNodeStatus(task), firstNonEmpty(task.AssignedAgentName, task.OwnerAccountID))
+		addNode("result_delivery", "结果产出", "result_delivery", resultNodeStatus(task), firstNonEmpty(task.ResultText, task.ErrorText))
+	default:
+		addNode("intake", "接收任务", "intake", "completed", task.RequestText)
+		addNode("route", "任务路由", "route", routeNodeStatus(task), routeDetail(task))
+		if task.ApprovalID != "" || task.TaskKind == "delegation_request" || task.TargetAccountID != task.OwnerAccountID {
+			approvalStatus, blockedReason := approvalNodeState(task, approval)
+			if blockedReason != "" {
+				graph.BlockedReason = blockedReason
+			}
+			addNode("approval", "等待授权", "approval", approvalStatus, approvalDetail(approval))
+			delegatedStatus := delegatedTaskNodeStatus(task, approval, children)
+			delegatedDetail := ""
+			if len(children) > 0 {
+				delegatedDetail = firstNonEmpty(children[0].ResultText, children[0].ErrorText, children[0].Status)
+			}
+			addNode("delegated_task", "远端执行", "delegated_task", delegatedStatus, delegatedDetail)
+		} else {
+			addNode("local_execution", "本地执行", "local_execution", executionNodeStatus(task), firstNonEmpty(task.AssignedAgentName, task.OwnerAccountID))
+		}
+		addNode("result_delivery", "结果回传", "result_delivery", resultNodeStatus(task), firstNonEmpty(task.ResultText, task.ErrorText))
+	}
+
+	finalStatus := task.Status
+	if finalStatus == "" {
+		finalStatus = "pending"
+	}
+	addNode("final", "结束", "final", finalStatus, firstNonEmpty(task.ErrorText, task.ResultText))
+	return graph
+}
+
 func (s *Service) userServiceURL(accountID string) string {
 	if s.publicBaseURL == "" {
 		return "/a2a/users/" + url.PathEscape(accountID)
@@ -1085,6 +1287,144 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func normalizeRoutingText(value string) string {
+	return strings.ToLower(strings.TrimSpace(strings.ReplaceAll(value, " ", "")))
+}
+
+func tokenMatch(normalizedText, candidate string) bool {
+	normalizedCandidate := normalizeRoutingText(candidate)
+	if normalizedCandidate == "" {
+		return false
+	}
+	if strings.Contains(normalizedText, normalizedCandidate) {
+		return true
+	}
+	for _, token := range splitRoutingTokens(candidate) {
+		token = normalizeRoutingText(token)
+		if len([]rune(token)) < 2 {
+			continue
+		}
+		if strings.Contains(normalizedText, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitRoutingTokens(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune("，,。.;；、/|:：()[]{}<>-_", r)
+	})
+}
+
+func decisionAuditCategory(reason string) string {
+	if strings.Contains(reason, "接近") {
+		return "auto-delegation-ambiguous"
+	}
+	return "auto-delegation-local-fallback"
+}
+
+func executionNodeStatus(task *TaskRecord) string {
+	switch task.Status {
+	case TaskStatusWorking:
+		return "running"
+	case TaskStatusCompleted:
+		return "completed"
+	case TaskStatusFailed:
+		return "failed"
+	case TaskStatusRejected:
+		return "rejected"
+	default:
+		return "pending"
+	}
+}
+
+func resultNodeStatus(task *TaskRecord) string {
+	switch task.Status {
+	case TaskStatusCompleted:
+		return "completed"
+	case TaskStatusFailed:
+		return "failed"
+	case TaskStatusRejected:
+		return "rejected"
+	case TaskStatusWaitingApproval:
+		return "pending"
+	default:
+		if strings.TrimSpace(task.ResultText) != "" || strings.TrimSpace(task.ErrorText) != "" {
+			return "completed"
+		}
+		return "pending"
+	}
+}
+
+func routeNodeStatus(task *TaskRecord) string {
+	if task.Status == TaskStatusSubmitted {
+		return "running"
+	}
+	return "completed"
+}
+
+func routeDetail(task *TaskRecord) string {
+	if task.ApprovalID != "" || task.TargetAccountID != task.OwnerAccountID {
+		return "已选择跨用户协作"
+	}
+	return "已选择本地处理"
+}
+
+func approvalNodeState(task *TaskRecord, approval *AuthorizationGrant) (string, string) {
+	if approval == nil {
+		if task.Status == TaskStatusWaitingApproval {
+			return "blocked", "等待对方用户批准"
+		}
+		return "pending", ""
+	}
+	switch approval.Status {
+	case ApprovalStatusPending:
+		return "blocked", "等待对方用户批准"
+	case ApprovalStatusApproved:
+		return "completed", ""
+	case ApprovalStatusRejected:
+		return "rejected", "协作请求已被拒绝"
+	default:
+		return "pending", ""
+	}
+}
+
+func approvalDetail(approval *AuthorizationGrant) string {
+	if approval == nil {
+		return ""
+	}
+	return firstNonEmpty(approval.RequestReason, approval.ResolvedReason)
+}
+
+func delegatedTaskNodeStatus(task *TaskRecord, approval *AuthorizationGrant, children []TaskRecord) string {
+	if approval != nil && approval.Status == ApprovalStatusRejected {
+		return "rejected"
+	}
+	if len(children) == 0 {
+		if approval != nil && approval.Status == ApprovalStatusPending {
+			return "pending"
+		}
+		if task.Status == TaskStatusWorking {
+			return "running"
+		}
+		return "pending"
+	}
+	child := children[0]
+	switch child.Status {
+	case TaskStatusCompleted:
+		return "completed"
+	case TaskStatusFailed:
+		return "failed"
+	case TaskStatusRejected:
+		return "rejected"
+	case TaskStatusWorking:
+		return "running"
+	default:
+		return "pending"
+	}
 }
 
 func taskTitle(text string) string {

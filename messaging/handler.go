@@ -600,7 +600,7 @@ func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, 
 		_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("处理失败：%v", err), msg.ContextToken, clientID)
 		return
 	}
-	reply := fmt.Sprintf("[任务 %s]\n%s", shortTaskID(task.ID), task.ResultText)
+	reply := fmt.Sprintf("[任务 %s]\n%s", shortTaskID(task.ID), h.userAgents.FormatTaskReply(task))
 	h.sendReplyWithMedia(ctx, client, msg, task.AssignedAgentName, reply, clientID)
 }
 

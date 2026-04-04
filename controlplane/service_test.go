@@ -53,20 +53,22 @@ func newTestService(t *testing.T) (*Store, *Service, *[]testSentMessage) {
 		t.Fatalf("sync accounts: %v", err)
 	}
 	if err := service.UpdateProfile(UpdateProfileInput{
-		AccountID:      "acct-a",
-		DisplayName:    "账号A",
-		Description:    "账号A主 Agent",
-		OwnerContactID: "owner-a",
-		BaseAgentName:  "codex",
+		AccountID:         "acct-a",
+		DisplayName:       "账号A",
+		Description:       "账号A主 Agent",
+		OwnerContactID:    "owner-a",
+		BaseAgentName:     "codex",
+		DelegationEnabled: true,
 	}); err != nil {
 		t.Fatalf("update profile a: %v", err)
 	}
 	if err := service.UpdateProfile(UpdateProfileInput{
-		AccountID:      "acct-b",
-		DisplayName:    "账号B",
-		Description:    "账号B主 Agent",
-		OwnerContactID: "owner-b",
-		BaseAgentName:  "claude",
+		AccountID:         "acct-b",
+		DisplayName:       "账号B",
+		Description:       "账号B主 Agent",
+		OwnerContactID:    "owner-b",
+		BaseAgentName:     "claude",
+		DelegationEnabled: true,
 	}); err != nil {
 		t.Fatalf("update profile b: %v", err)
 	}
@@ -165,4 +167,100 @@ func TestSubmitOwnerTaskAutoDelegatesByHeuristic(t *testing.T) {
 	if len(*sent) == 0 || (*sent)[0].accountID != "acct-b" {
 		t.Fatalf("expected approval notice to acct-b owner, sent=%#v", *sent)
 	}
+}
+
+func TestSubmitOwnerTaskAutoDelegatesBySpecialization(t *testing.T) {
+	store, service, sent := newTestService(t)
+
+	if err := service.UpdateProfile(UpdateProfileInput{
+		AccountID:              "acct-b",
+		DisplayName:            "Nano",
+		Description:            "嵌入式和硬件方向 Agent",
+		OwnerContactID:         "owner-b",
+		BaseAgentName:          "claude",
+		SpecializationTags:     []string{"嵌入式", "硬件", "板卡"},
+		SpecializationExamples: []string{"Jetson 性能调优", "串口驱动排障"},
+		DelegationEnabled:      true,
+	}); err != nil {
+		t.Fatalf("update profile specialization: %v", err)
+	}
+
+	decision, err := service.decideOwnerTask(context.Background(), &UserAgentProfile{
+		AccountID:      "acct-a",
+		DisplayName:    "账号A",
+		Description:    "账号A主 Agent",
+		BaseAgentName:  "codex",
+		OwnerContactID: "owner-a",
+	}, "owner-a", "帮我看一下这个 Jetson 板卡驱动问题")
+	if err != nil {
+		t.Fatalf("decide owner task: %v", err)
+	}
+	if decision.Action != "delegate" || decision.TargetAccountID != "acct-b" {
+		t.Fatalf("decision = %#v, want delegate acct-b", decision)
+	}
+
+	task, err := service.SubmitOwnerTask(context.Background(), "acct-a", "owner-a", "帮我看一下这个 Jetson 板卡驱动问题")
+	if err != nil {
+		t.Fatalf("submit owner task with specialization: %v", err)
+	}
+	if task.Status != TaskStatusWaitingApproval {
+		t.Fatalf("task.Status = %q, want %q", task.Status, TaskStatusWaitingApproval)
+	}
+	if task.TargetAccountID != "acct-b" {
+		t.Fatalf("task.TargetAccountID = %q, want acct-b", task.TargetAccountID)
+	}
+
+	audit, err := store.ListTaskAudit(task.ID, 20)
+	if err != nil {
+		t.Fatalf("list task audit: %v", err)
+	}
+	found := false
+	for _, item := range audit {
+		if item.Category == "auto-delegation-selected" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected auto-delegation-selected audit, got %#v", audit)
+	}
+	if len(*sent) == 0 || (*sent)[0].accountID != "acct-b" {
+		t.Fatalf("expected approval notice to acct-b owner, sent=%#v", *sent)
+	}
+}
+
+func TestGetTaskDetailBuildsWorkflowGraph(t *testing.T) {
+	_, service, _ := newTestService(t)
+
+	task, grant, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "请帮我完成跨账号任务")
+	if err != nil {
+		t.Fatalf("create delegation: %v", err)
+	}
+	if _, err := service.ApproveGrant(context.Background(), grant.ID, "owner-b"); err != nil {
+		t.Fatalf("approve grant: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		detail, err := service.GetTaskDetail(task.ID, 50)
+		if err != nil {
+			t.Fatalf("get task detail: %v", err)
+		}
+		if detail != nil && detail.Task != nil && detail.Task.Status == TaskStatusCompleted {
+			if detail.Workflow == nil || len(detail.Workflow.Nodes) < 4 {
+				t.Fatalf("workflow = %#v, want populated graph", detail.Workflow)
+			}
+			if detail.Workflow.Status != TaskStatusCompleted {
+				t.Fatalf("workflow.Status = %q, want %q", detail.Workflow.Status, TaskStatusCompleted)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	detail, err := service.GetTaskDetail(task.ID, 50)
+	if err != nil {
+		t.Fatalf("get task detail after wait: %v", err)
+	}
+	t.Fatalf("task detail did not reach completed state: %#v", detail)
 }

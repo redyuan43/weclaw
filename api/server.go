@@ -71,7 +71,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/.well-known/agent-card.json", s.handleWellKnownAgentCard)
 	mux.HandleFunc("/a2a/users/", s.handleA2AUser)
 	mux.HandleFunc("/console", s.handleConsole)
-	mux.HandleFunc("/console/", s.handleConsoleAction)
+	mux.HandleFunc("/console/", s.handleConsoleRoute)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")

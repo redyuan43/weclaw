@@ -36,6 +36,7 @@ type AgentCard struct {
 	DefaultOutputModes []string          `json:"defaultOutputModes,omitempty"`
 	Capabilities       AgentCapabilities `json:"capabilities"`
 	Skills             []AgentSkill      `json:"skills,omitempty"`
+	Metadata           map[string]any    `json:"metadata,omitempty"`
 }
 
 type AgentProvider struct {
