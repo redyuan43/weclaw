@@ -470,16 +470,15 @@ func (r *BridgeRuntime) processTaskAsync(task *BridgeTask) {
 		return
 	}
 	r.logf(task, "queueing async processing")
-	go func(taskID string) {
-		task := r.store.Get(taskID)
-		if task == nil {
-			log.Printf("[bridge] task=%s missing before async processing", taskID)
-			return
-		}
-		if _, err := r.processTask(context.Background(), task); err != nil {
-			r.logf(task, "async processing error: %v", err)
-		}
-	}(task.TaskID)
+	taskID := task.TaskID
+	task = r.store.Get(taskID)
+	if task == nil {
+		log.Printf("[bridge] task=%s missing before async processing", taskID)
+		return
+	}
+	if _, err := r.processTask(context.Background(), task); err != nil {
+		r.logf(task, "async processing error: %v", err)
+	}
 }
 
 func (r *BridgeRuntime) decide(ctx context.Context, task *BridgeTask) (BridgeDecision, error) {
@@ -703,9 +702,8 @@ func (r *BridgeRuntime) applyDecision(ctx context.Context, task *BridgeTask, dec
 
 		task.PeerNodeID = targetNode
 		task.Metadata["context_token"] = ""
-		if task.Status == BridgeTaskCompleted || task.Status == BridgeTaskFailed {
-			r.store.Save(task)
-			r.logf(task, "preserving task status=%s after synchronous peer callback", task.Status)
+		if latest := r.store.Get(task.TaskID); latest != nil && (latest.Status == BridgeTaskCompleted || latest.Status == BridgeTaskFailed) {
+			r.logf(latest, "preserving task status=%s after synchronous peer callback", latest.Status)
 			return "peer", nil
 		}
 		if task.OriginKind == "local_user" && deliveryMode == DeliveryModeDeliverToPeerUser {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/agent"
+	"github.com/fastclaw-ai/weclaw/controlplane"
 	"github.com/fastclaw-ai/weclaw/ilink"
 	"github.com/google/uuid"
 )
@@ -33,6 +34,7 @@ type AgentMeta struct {
 // Handler processes incoming WeChat messages and dispatches replies.
 type Handler struct {
 	mu             sync.RWMutex
+	laneMu         sync.Mutex
 	defaultName    string
 	agents         map[string]agent.Agent // name -> running agent
 	agentMetas     []AgentMeta            // all configured agents (for /status)
@@ -46,8 +48,16 @@ type Handler struct {
 	seenMsgs       sync.Map // map[int64]time.Time — dedup by message_id
 	bridge         *BridgeRuntime
 	inbox          *InboxStore
+	userAgents     *controlplane.Service
 	localTimeout   time.Duration
 	slowReplyDelay time.Duration
+	userLanes      map[string]chan queuedInbound
+}
+
+type queuedInbound struct {
+	ctx    context.Context
+	client *ilink.Client
+	msg    ilink.WeixinMessage
 }
 
 type LocalAgentChatResult struct {
@@ -65,6 +75,7 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 		saveDefault:    saveDefault,
 		localTimeout:   2 * time.Minute,
 		slowReplyDelay: 3 * time.Second,
+		userLanes:      make(map[string]chan queuedInbound),
 	}
 }
 
@@ -87,6 +98,22 @@ func (h *Handler) SetBridge(bridge *BridgeRuntime) {
 // SetInboxStore configures a recent inbound-message store for local automation and testing.
 func (h *Handler) SetInboxStore(store *InboxStore) {
 	h.inbox = store
+}
+
+func (h *Handler) SetUserAgents(service *controlplane.Service) {
+	h.userAgents = service
+}
+
+func (h *Handler) ContextTokenForUser(userID string) string {
+	if userID == "" {
+		return ""
+	}
+	if value, ok := h.contextTokens.Load(userID); ok {
+		if token, ok := value.(string); ok {
+			return token
+		}
+	}
+	return ""
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -289,6 +316,31 @@ func (h *Handler) parseCommand(text string) ([]string, string) {
 
 // HandleMessage processes a single incoming message.
 func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage) {
+	h.enqueueMessage(ctx, client, msg)
+}
+
+func (h *Handler) enqueueMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage) {
+	key := client.BotID() + "|" + msg.FromUserID
+
+	h.laneMu.Lock()
+	lane := h.userLanes[key]
+	if lane == nil {
+		lane = make(chan queuedInbound, 64)
+		h.userLanes[key] = lane
+		go h.runUserLane(key, lane)
+	}
+	h.laneMu.Unlock()
+
+	lane <- queuedInbound{ctx: ctx, client: client, msg: msg}
+}
+
+func (h *Handler) runUserLane(key string, lane chan queuedInbound) {
+	for item := range lane {
+		h.processMessage(item.ctx, item.client, item.msg)
+	}
+}
+
+func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage) {
 	// Only process user messages that are finished
 	if msg.MessageType != ilink.MessageTypeUser {
 		return
@@ -314,6 +366,14 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 			text = voiceText
 			log.Printf("[handler] voice transcription from %s: %q", msg.FromUserID, truncate(text, 80))
 		}
+	}
+	ownerMessage := h.userAgents != nil && h.userAgents.IsOwnerContact(client.BotID(), msg.FromUserID)
+	if ownerMessage && strings.TrimSpace(text) != "" {
+		log.Printf("[handler] owner message routed to user-agent control plane account=%s from=%s", client.BotID(), msg.FromUserID)
+		h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
+		clientID := NewClientID()
+		h.handleOwnerMessage(ctx, client, msg, strings.TrimSpace(text), clientID)
+		return
 	}
 	if h.mediaService != nil {
 		incomingMedia, hasMedia, err := h.collectIncomingRichMedia(ctx, msg)
@@ -344,9 +404,14 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 
 	// Generate a clientID for this reply (used to correlate typing → finish)
 	clientID := NewClientID()
+	trimmed := strings.TrimSpace(text)
+
+	if ownerMessage {
+		h.handleOwnerMessage(ctx, client, msg, trimmed, clientID)
+		return
+	}
 
 	// Intercept URLs: save to Linkhoard directly without AI agent
-	trimmed := strings.TrimSpace(text)
 	if h.saveDir != "" && IsURL(trimmed) {
 		rawURL := ExtractURL(trimmed)
 		if rawURL != "" {
@@ -495,6 +560,158 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		// Multi-agent broadcast: parallel dispatch, send replies as they arrive
 		h.broadcastToAgents(ctx, client, msg, knownNames, message)
 	}
+}
+
+func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, trimmed, clientID string) {
+	if h.userAgents != nil {
+		commands, expandErr := h.userAgents.ExpandIngressCommands(client.BotID(), trimmed)
+		if expandErr == nil && len(commands) > 0 {
+			if handled, reply := h.handleOwnerIngressCommands(ctx, client, msg, commands); handled {
+				_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+				return
+			}
+		}
+	}
+
+	switch {
+	case trimmed == "/help" || trimmed == "/ua-help":
+		_ = SendTextReply(ctx, client, msg.FromUserID, buildOwnerHelpText(), msg.ContextToken, clientID)
+		return
+
+	case trimmed == "/tasks":
+		tasks, err := h.userAgents.ListTasksForAccount(client.BotID(), 20)
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("读取任务失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		reply := formatOwnerTaskList(client.BotID(), tasks)
+		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
+
+	case trimmed == "/agents":
+		profiles, err := h.userAgents.ListProfiles()
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("读取 Agent 列表失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		_ = SendTextReply(ctx, client, msg.FromUserID, formatOwnerAgentList(profiles), msg.ContextToken, clientID)
+		return
+
+	case trimmed == "/capabilities":
+		bindings, err := h.userAgents.ListCapabilityBindings(client.BotID())
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("读取能力失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		_ = SendTextReply(ctx, client, msg.FromUserID, formatOwnerCapabilities(bindings), msg.ContextToken, clientID)
+		return
+
+	case strings.HasPrefix(trimmed, "/approve "):
+		approvalID := strings.TrimSpace(strings.TrimPrefix(trimmed, "/approve"))
+		grant, err := h.userAgents.ApproveGrant(ctx, approvalID, msg.FromUserID)
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("批准失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		reply := fmt.Sprintf("已批准协作请求 %s，任务开始执行。", shortTaskID(grant.ID))
+		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
+
+	case strings.HasPrefix(trimmed, "/reject "):
+		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "/reject"))
+		parts := strings.SplitN(payload, " ", 2)
+		approvalID := strings.TrimSpace(parts[0])
+		reason := ""
+		if len(parts) == 2 {
+			reason = strings.TrimSpace(parts[1])
+		}
+		grant, err := h.userAgents.RejectGrant(ctx, approvalID, msg.FromUserID, reason)
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("拒绝失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		reply := fmt.Sprintf("已拒绝协作请求 %s。", shortTaskID(grant.ID))
+		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
+
+	case strings.HasPrefix(trimmed, "/delegate "):
+		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "/delegate"))
+		parts := strings.SplitN(payload, " ", 2)
+		if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			_ = SendTextReply(ctx, client, msg.FromUserID, "用法：/delegate 目标账号或显示名 任务内容", msg.ContextToken, clientID)
+			return
+		}
+		task, grant, err := h.userAgents.CreateDelegation(ctx, client.BotID(), msg.FromUserID, parts[0], parts[1])
+		if err != nil {
+			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("发起协作失败：%v", err), msg.ContextToken, clientID)
+			return
+		}
+		reply := fmt.Sprintf("已发起协作任务 %s。\n审批码：%s\n等待对方批准后执行。", shortTaskID(task.ID), shortTaskID(grant.ID))
+		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
+	}
+
+	task, err := h.userAgents.SubmitOwnerTask(ctx, client.BotID(), msg.FromUserID, trimmed)
+	if err != nil {
+		_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("处理失败：%v", err), msg.ContextToken, clientID)
+		return
+	}
+	reply := fmt.Sprintf("[任务 %s]\n%s", shortTaskID(task.ID), h.userAgents.FormatTaskReply(task))
+	h.sendReplyWithMedia(ctx, client, msg, task.AssignedAgentName, reply, clientID)
+}
+
+func (h *Handler) handleOwnerIngressCommands(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, commands []string) (bool, string) {
+	if h.userAgents == nil || len(commands) == 0 {
+		return false, ""
+	}
+
+	var replies []string
+	for _, command := range commands {
+		decision, err := h.userAgents.ResolveIngressDecision(client.BotID(), msg.FromUserID, command)
+		if err != nil {
+			replies = append(replies, fmt.Sprintf("处理失败：%v", err))
+			return true, strings.Join(replies, "\n")
+		}
+		switch decision.Kind {
+		case controlplane.IngressDecisionClarify:
+			replies = append(replies, decision.ClarificationText)
+			return true, strings.Join(replies, "\n")
+		case controlplane.IngressDecisionApproval:
+			if decision.ApprovalAction == "approve" {
+				resolvedBy := msg.FromUserID
+				if strings.TrimSpace(decision.ApprovalReason) != "" {
+					resolvedBy = decision.ApprovalReason
+				}
+				grant, approveErr := h.userAgents.ApproveGrant(ctx, decision.ApprovalID, resolvedBy)
+				if approveErr != nil {
+					replies = append(replies, fmt.Sprintf("批准失败：%v", approveErr))
+					return true, strings.Join(replies, "\n")
+				}
+				replies = append(replies, fmt.Sprintf("已批准协作请求 %s。", shortTaskID(grant.ID)))
+				continue
+			}
+			if decision.ApprovalAction == "reject" {
+				grant, rejectErr := h.userAgents.RejectGrant(ctx, decision.ApprovalID, msg.FromUserID, decision.ApprovalReason)
+				if rejectErr != nil {
+					replies = append(replies, fmt.Sprintf("拒绝失败：%v", rejectErr))
+					return true, strings.Join(replies, "\n")
+				}
+				replies = append(replies, fmt.Sprintf("已拒绝协作请求 %s。", shortTaskID(grant.ID)))
+				continue
+			}
+		default:
+			if len(replies) == 0 {
+				return false, ""
+			}
+			replies = append(replies, fmt.Sprintf("未识别命令：%s", command))
+			return true, strings.Join(replies, "\n")
+		}
+	}
+
+	if len(replies) == 0 {
+		return false, ""
+	}
+	return true, strings.Join(replies, "\n")
 }
 
 // sendToDefaultAgent sends the message to the default agent and replies.
@@ -884,6 +1101,69 @@ func buildHelpText() string {
 /help - Show this help message
 
 Aliases: /cc(claude) /cx(codex) /cs(cursor) /km(kimi) /gm(gemini) /oc(openclaw) /ocd(opencode) /pi(pi) /cp(copilot) /dr(droid) /if(iflow) /kr(kiro) /qw(qwen)`
+}
+
+func buildOwnerHelpText() string {
+	return `用户 Agent 命令:
+/tasks - 查看最近任务
+/agents - 查看已注册用户 Agent
+/capabilities - 查看当前账号启用能力
+/delegate 目标 任务 - 发起跨用户协作
+/approve 审批码 - 同意协作请求
+/reject 审批码 原因 - 拒绝协作请求
+/help - 查看帮助
+
+直接发送普通文本，会交给当前账号的主 Agent 处理。`
+}
+
+func formatOwnerTaskList(accountID string, tasks []controlplane.TaskRecord) string {
+	var lines []string
+	for _, task := range tasks {
+		if task.RequesterAccountID != accountID && task.TargetAccountID != accountID && task.OwnerAccountID != accountID {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s [%s] %s", shortTaskID(task.ID), task.Status, task.Title))
+		if len(lines) >= 8 {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		return "最近没有任务。"
+	}
+	return "最近任务：\n" + strings.Join(lines, "\n")
+}
+
+func formatOwnerAgentList(profiles []controlplane.UserAgentProfile) string {
+	if len(profiles) == 0 {
+		return "暂无用户 Agent。"
+	}
+	var lines []string
+	for _, profile := range profiles {
+		lines = append(lines, fmt.Sprintf("%s -> %s", profile.AccountID, firstNonBlank(profile.DisplayName, profile.BaseAgentName)))
+	}
+	return "用户 Agent：\n" + strings.Join(lines, "\n")
+}
+
+func formatOwnerCapabilities(bindings []controlplane.CapabilityBinding) string {
+	if len(bindings) == 0 {
+		return "当前账号未启用能力。"
+	}
+	var lines []string
+	for _, binding := range bindings {
+		state := "关闭"
+		if binding.Enabled {
+			state = "开启"
+		}
+		lines = append(lines, fmt.Sprintf("%s [%s]", binding.Name, state))
+	}
+	return "当前能力：\n" + strings.Join(lines, "\n")
+}
+
+func shortTaskID(taskID string) string {
+	if len(taskID) <= 8 {
+		return taskID
+	}
+	return taskID[:8]
 }
 
 func extractText(msg ilink.WeixinMessage) string {

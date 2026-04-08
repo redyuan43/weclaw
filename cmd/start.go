@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/fastclaw-ai/weclaw/agent"
 	"github.com/fastclaw-ai/weclaw/api"
 	"github.com/fastclaw-ai/weclaw/config"
+	"github.com/fastclaw-ai/weclaw/controlplane"
 	"github.com/fastclaw-ai/weclaw/ilink"
 	"github.com/fastclaw-ai/weclaw/messaging"
 	"github.com/mdp/qrterminal/v3"
@@ -152,6 +154,57 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Load custom aliases from agent configs
 	handler.SetCustomAliases(config.BuildAliasMap(cfg.Agents))
 	handler.SetInboxStore(inboxStore)
+
+	apiAddr := cfg.APIAddr
+	if cfg.Bridge.Enabled && cfg.Bridge.ListenAddr != "" {
+		apiAddr = cfg.Bridge.ListenAddr
+	}
+	if apiAddrFlag != "" {
+		apiAddr = apiAddrFlag
+	}
+
+	controlStore, err := controlplane.Open("")
+	if err != nil {
+		return fmt.Errorf("failed to open control store: %w", err)
+	}
+	defer controlStore.Close()
+
+	userAgents := controlplane.NewService(
+		controlStore,
+		resolvePublicBaseURL(cfg, apiAddr),
+		func(ctx context.Context, conversationID, message, agentName string) (controlplane.ChatResult, error) {
+			result, err := handler.ChatLocalAgent(ctx, conversationID, message, agentName)
+			if err != nil {
+				return controlplane.ChatResult{}, err
+			}
+			return controlplane.ChatResult{
+				Reply:     result.Reply,
+				AgentName: result.AgentName,
+				Model:     result.Info.Model,
+			}, nil
+		},
+		func(ctx context.Context, accountID, toUserID, text, contextToken string) error {
+			client, err := selectLocalClient(clientByID, defaultClient, accountID)
+			if err != nil {
+				return err
+			}
+			if contextToken == "" {
+				contextToken = handler.ContextTokenForUser(toUserID)
+			}
+			return messaging.SendTextReply(ctx, client, toUserID, text, contextToken, "")
+		},
+	)
+	userAgents.SetAvailableBaseAgents(namesFromMetas(metas))
+	handler.SetUserAgents(userAgents)
+
+	accountOwners := make(map[string]string, len(accounts))
+	for _, creds := range accounts {
+		accountOwners[creds.ILinkBotID] = creds.ILinkUserID
+	}
+	if err := userAgents.SyncAccounts(accountOwners, cfg.DefaultAgent); err != nil {
+		return fmt.Errorf("failed to sync user agents: %w", err)
+	}
+
 	if cfg.Bridge.Enabled {
 		handler.SetBridge(messaging.NewBridgeRuntime(
 			messaging.BridgeConfig{
@@ -174,6 +227,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 					client, err := selectLocalClient(clientByID, defaultClient, accountID)
 					if err != nil {
 						return err
+					}
+					if contextToken == "" {
+						contextToken = handler.ContextTokenForUser(toUserID)
 					}
 					return messaging.SendTextReply(ctx, client, toUserID, text, contextToken, "")
 				},
@@ -203,15 +259,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Resolve API addr: flag > bridge.listen_addr > api_addr > default
-	apiAddr := cfg.APIAddr
-	if cfg.Bridge.Enabled && cfg.Bridge.ListenAddr != "" {
-		apiAddr = cfg.Bridge.ListenAddr
-	}
-	if apiAddrFlag != "" {
-		apiAddr = apiAddrFlag
-	}
 	apiServer := api.NewServer(clients, apiAddr, inboxStore, handler)
+	apiServer.SetUserAgents(userAgents)
 	go func() {
 		if err := apiServer.Run(ctx); err != nil {
 			log.Printf("API server error: %v", err)
@@ -233,6 +282,34 @@ func runStart(cmd *cobra.Command, args []string) error {
 	wg.Wait()
 	log.Println("All monitors stopped")
 	return nil
+}
+
+func resolvePublicBaseURL(cfg *config.Config, apiAddr string) string {
+	if cfg != nil && cfg.Bridge.PublicBaseURL != "" {
+		return strings.TrimRight(cfg.Bridge.PublicBaseURL, "/")
+	}
+	addr := strings.TrimSpace(apiAddr)
+	if addr == "" {
+		addr = "127.0.0.1:18011"
+	}
+	switch {
+	case strings.HasPrefix(addr, "http://"), strings.HasPrefix(addr, "https://"):
+		return strings.TrimRight(addr, "/")
+	case strings.HasPrefix(addr, ":"):
+		return "http://127.0.0.1" + addr
+	case strings.HasPrefix(addr, "0.0.0.0:"):
+		return "http://127.0.0.1:" + strings.TrimPrefix(addr, "0.0.0.0:")
+	default:
+		return "http://" + addr
+	}
+}
+
+func namesFromMetas(metas []messaging.AgentMeta) []string {
+	out := make([]string, 0, len(metas))
+	for _, meta := range metas {
+		out = append(out, meta.Name)
+	}
+	return out
 }
 
 func selectLocalClient(clients map[string]*ilink.Client, defaultClient *ilink.Client, accountID string) (*ilink.Client, error) {
