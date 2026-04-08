@@ -613,7 +613,7 @@ func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, 
 			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("批准失败：%v", err), msg.ContextToken, clientID)
 			return
 		}
-		reply := fmt.Sprintf("已批准协作请求 %s，任务开始执行。", grant.ID)
+		reply := fmt.Sprintf("已批准协作请求 %s，任务开始执行。", shortTaskID(grant.ID))
 		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
 		return
 
@@ -630,7 +630,7 @@ func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, 
 			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("拒绝失败：%v", err), msg.ContextToken, clientID)
 			return
 		}
-		reply := fmt.Sprintf("已拒绝协作请求 %s。", grant.ID)
+		reply := fmt.Sprintf("已拒绝协作请求 %s。", shortTaskID(grant.ID))
 		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
 		return
 
@@ -646,7 +646,7 @@ func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, 
 			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("发起协作失败：%v", err), msg.ContextToken, clientID)
 			return
 		}
-		reply := fmt.Sprintf("已发起协作任务 %s。\n授权编号：%s\n等待对方批准后执行。", shortTaskID(task.ID), grant.ID)
+		reply := fmt.Sprintf("已发起协作任务 %s。\n审批码：%s\n等待对方批准后执行。", shortTaskID(task.ID), shortTaskID(grant.ID))
 		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
 		return
 	}
@@ -1109,8 +1109,8 @@ func buildOwnerHelpText() string {
 /agents - 查看已注册用户 Agent
 /capabilities - 查看当前账号启用能力
 /delegate 目标 任务 - 发起跨用户协作
-/approve 授权编号 - 同意协作请求
-/reject 授权编号 原因 - 拒绝协作请求
+/approve 审批码 - 同意协作请求
+/reject 审批码 原因 - 拒绝协作请求
 /help - 查看帮助
 
 直接发送普通文本，会交给当前账号的主 Agent 处理。`

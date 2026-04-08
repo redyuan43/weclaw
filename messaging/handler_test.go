@@ -168,6 +168,19 @@ func TestBuildHelpText(t *testing.T) {
 	}
 }
 
+func TestBuildOwnerHelpTextUsesApprovalCode(t *testing.T) {
+	text := buildOwnerHelpText()
+	if !strings.Contains(text, "/approve 审批码") {
+		t.Fatalf("owner help text = %q, want approval code command", text)
+	}
+	if !strings.Contains(text, "/reject 审批码 原因") {
+		t.Fatalf("owner help text = %q, want reject approval code command", text)
+	}
+	if strings.Contains(text, "授权编号") {
+		t.Fatalf("owner help text = %q, should not mention 授权编号", text)
+	}
+}
+
 func TestChatLocalAgent_UsesConfiguredDefaultAgent(t *testing.T) {
 	ag := &fakeAgent{
 		info:  agent.AgentInfo{Name: "codex", Type: "acp", Model: "gpt-5.1-codex-mini"},

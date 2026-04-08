@@ -467,7 +467,7 @@ var consoleTemplates = template.Must(template.New("console").Funcs(template.Func
   </div>
   <table>
     <thead>
-      <tr><th>授权编号</th><th>任务</th><th>请求方</th><th>审批方</th><th>状态</th><th>请求内容</th><th>任务视图</th><th>操作</th></tr>
+      <tr><th>审批码</th><th>任务</th><th>请求方</th><th>审批方</th><th>状态</th><th>请求内容</th><th>任务视图</th><th>操作</th></tr>
     </thead>
     <tbody>
       {{range .Approvals}}

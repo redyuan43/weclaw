@@ -114,6 +114,12 @@ func TestDelegationApprovalFlow(t *testing.T) {
 	if len(*sent) == 0 || (*sent)[0].toUserID != "owner-b" {
 		t.Fatalf("expected approval message to owner-b, sent=%#v", *sent)
 	}
+	if !strings.Contains((*sent)[0].text, "审批码: "+shortCode(grant.ID)) {
+		t.Fatalf("approval notice = %q, want short approval code", (*sent)[0].text)
+	}
+	if strings.Contains((*sent)[0].text, grant.ID) {
+		t.Fatalf("approval notice = %q, should not contain full approval id", (*sent)[0].text)
+	}
 
 	if _, err := service.ApproveGrant(context.Background(), grant.ID, "owner-b"); err != nil {
 		t.Fatalf("approve grant: %v", err)
@@ -142,6 +148,44 @@ func TestDelegationApprovalFlow(t *testing.T) {
 		t.Fatalf("get parent task after wait: %v", err)
 	}
 	t.Fatalf("task did not complete, final state=%#v", parent)
+}
+
+func TestApproveGrantHistoryUsesShortApprovalCode(t *testing.T) {
+	store, service, _ := newTestService(t)
+
+	task, grant, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "请帮我完成跨账号任务")
+	if err != nil {
+		t.Fatalf("create delegation: %v", err)
+	}
+
+	if _, err := service.ApproveGrant(context.Background(), grant.ID, "owner-b"); err != nil {
+		t.Fatalf("approve grant: %v", err)
+	}
+
+	parent, err := store.GetTask(task.ID, 20)
+	if err != nil {
+		t.Fatalf("get parent task: %v", err)
+	}
+	if parent == nil {
+		t.Fatal("parent task is nil")
+	}
+
+	found := false
+	for _, item := range parent.History {
+		if item.Kind != "approval-approved" {
+			continue
+		}
+		found = true
+		if !strings.Contains(item.Message, "审批码 "+shortCode(grant.ID)+" 已批准") {
+			t.Fatalf("history message = %q, want short approval code", item.Message)
+		}
+		if strings.Contains(item.Message, grant.ID) {
+			t.Fatalf("history message = %q, should not contain full approval id", item.Message)
+		}
+	}
+	if !found {
+		t.Fatalf("approval-approved history not found: %#v", parent.History)
+	}
 }
 
 func TestSubmitOwnerTaskAutoDelegatesByHeuristic(t *testing.T) {
@@ -264,6 +308,44 @@ func TestGetTaskDetailBuildsWorkflowGraph(t *testing.T) {
 		t.Fatalf("get task detail after wait: %v", err)
 	}
 	t.Fatalf("task detail did not reach completed state: %#v", detail)
+}
+
+func TestRejectGrantHistoryUsesShortApprovalCode(t *testing.T) {
+	store, service, _ := newTestService(t)
+
+	task, grant, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "请帮我完成跨账号任务")
+	if err != nil {
+		t.Fatalf("create delegation: %v", err)
+	}
+
+	if _, err := service.RejectGrant(context.Background(), grant.ID, "先不处理"); err != nil {
+		t.Fatalf("reject grant: %v", err)
+	}
+
+	parent, err := store.GetTask(task.ID, 20)
+	if err != nil {
+		t.Fatalf("get parent task: %v", err)
+	}
+	if parent == nil {
+		t.Fatal("parent task is nil")
+	}
+
+	found := false
+	for _, item := range parent.History {
+		if item.Kind != "approval-rejected" {
+			continue
+		}
+		found = true
+		if !strings.Contains(item.Message, "审批码 "+shortCode(grant.ID)+" 已拒绝") {
+			t.Fatalf("history message = %q, want short approval code", item.Message)
+		}
+		if strings.Contains(item.Message, grant.ID) {
+			t.Fatalf("history message = %q, should not contain full approval id", item.Message)
+		}
+	}
+	if !found {
+		t.Fatalf("approval-rejected history not found: %#v", parent.History)
+	}
 }
 
 func TestResolveIngressDecisionApprovesUniquePendingApproval(t *testing.T) {

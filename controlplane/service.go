@@ -918,7 +918,7 @@ func (s *Service) ApproveGrant(ctx context.Context, approvalID, resolvedBy strin
 		Actor:          "system",
 		ActorAccountID: grant.ApproverAccountID,
 		Kind:           "approval-approved",
-		Message:        fmt.Sprintf("授权 %s 已批准，开始执行委派任务", grant.ID),
+		Message:        fmt.Sprintf("审批码 %s 已批准，开始执行委派任务", shortCode(grant.ID)),
 	})
 	_ = s.store.AppendAudit(AppendAuditInput{
 		TaskID:    parentTask.ID,
@@ -994,7 +994,7 @@ func (s *Service) RejectGrant(ctx context.Context, approvalID, reason string) (*
 			Actor:          "system",
 			ActorAccountID: grant.ApproverAccountID,
 			Kind:           "approval-rejected",
-			Message:        fmt.Sprintf("授权 %s 已拒绝", grant.ID),
+			Message:        fmt.Sprintf("审批码 %s 已拒绝", shortCode(grant.ID)),
 		})
 		_ = s.store.AppendAudit(AppendAuditInput{
 			TaskID:    parentTask.ID,
@@ -1523,7 +1523,7 @@ func buildApprovalClarification(contexts []ActiveContext) string {
 	var lines []string
 	lines = append(lines, "主人，现在有多个待审批任务，蜜桃喵不敢乱认喵，请明确回复：")
 	for idx, item := range contexts {
-		lines = append(lines, fmt.Sprintf("%d. [%s] %s", idx+1, item.DisplayID, item.Title))
+		lines = append(lines, fmt.Sprintf("%d. 审批码[%s] %s", idx+1, item.DisplayID, item.Title))
 	}
 	lines = append(lines, "可以直接回复：批准 第一个")
 	lines = append(lines, "或者：拒绝 第二个 原因")
