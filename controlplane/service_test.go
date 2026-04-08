@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,7 +16,26 @@ type testSentMessage struct {
 	text      string
 }
 
-func newTestService(t *testing.T) (*Store, *Service, *[]testSentMessage) {
+type testSentRecorder struct {
+	mu    sync.Mutex
+	items []testSentMessage
+}
+
+func (r *testSentRecorder) Append(item testSentMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items = append(r.items, item)
+}
+
+func (r *testSentRecorder) Snapshot() []testSentMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]testSentMessage, len(r.items))
+	copy(out, r.items)
+	return out
+}
+
+func newTestService(t *testing.T) (*Store, *Service, *testSentRecorder) {
 	t.Helper()
 
 	store, err := Open(filepath.Join(t.TempDir(), "control.db"))
@@ -26,7 +46,7 @@ func newTestService(t *testing.T) (*Store, *Service, *[]testSentMessage) {
 		store.Close()
 	})
 
-	var sent []testSentMessage
+	sent := &testSentRecorder{}
 	service := NewService(
 		store,
 		"http://127.0.0.1:18011",
@@ -38,7 +58,7 @@ func newTestService(t *testing.T) (*Store, *Service, *[]testSentMessage) {
 			}, nil
 		},
 		func(_ context.Context, accountID, toUserID, text, _ string) error {
-			sent = append(sent, testSentMessage{
+			sent.Append(testSentMessage{
 				accountID: accountID,
 				toUserID:  toUserID,
 				text:      text,
@@ -74,7 +94,7 @@ func newTestService(t *testing.T) (*Store, *Service, *[]testSentMessage) {
 		t.Fatalf("update profile b: %v", err)
 	}
 
-	return store, service, &sent
+	return store, service, sent
 }
 
 func TestBuildAgentCard(t *testing.T) {
@@ -111,14 +131,15 @@ func TestDelegationApprovalFlow(t *testing.T) {
 	if grant.Status != ApprovalStatusPending {
 		t.Fatalf("grant.Status = %q, want %q", grant.Status, ApprovalStatusPending)
 	}
-	if len(*sent) == 0 || (*sent)[0].toUserID != "owner-b" {
-		t.Fatalf("expected approval message to owner-b, sent=%#v", *sent)
+	snapshot := sent.Snapshot()
+	if len(snapshot) == 0 || snapshot[0].toUserID != "owner-b" {
+		t.Fatalf("expected approval message to owner-b, sent=%#v", snapshot)
 	}
-	if !strings.Contains((*sent)[0].text, "审批码: "+shortCode(grant.ID)) {
-		t.Fatalf("approval notice = %q, want short approval code", (*sent)[0].text)
+	if !strings.Contains(snapshot[0].text, "审批码: "+shortCode(grant.ID)) {
+		t.Fatalf("approval notice = %q, want short approval code", snapshot[0].text)
 	}
-	if strings.Contains((*sent)[0].text, grant.ID) {
-		t.Fatalf("approval notice = %q, should not contain full approval id", (*sent)[0].text)
+	if strings.Contains(snapshot[0].text, grant.ID) {
+		t.Fatalf("approval notice = %q, should not contain full approval id", snapshot[0].text)
 	}
 
 	if _, err := service.ApproveGrant(context.Background(), grant.ID, "owner-b"); err != nil {
@@ -135,8 +156,8 @@ func TestDelegationApprovalFlow(t *testing.T) {
 			if parent.ResultText == "" {
 				t.Fatal("parent.ResultText is empty")
 			}
-			if len(*sent) < 2 {
-				t.Fatalf("expected requester notification, sent=%#v", *sent)
+			if len(sent.Snapshot()) < 2 {
+				t.Fatalf("expected requester notification, sent=%#v", sent.Snapshot())
 			}
 			return
 		}
@@ -209,8 +230,9 @@ func TestSubmitOwnerTaskAutoDelegatesByHeuristic(t *testing.T) {
 	if grant == nil || grant.Status != ApprovalStatusPending {
 		t.Fatalf("grant = %#v, want pending", grant)
 	}
-	if len(*sent) == 0 || (*sent)[0].accountID != "acct-b" {
-		t.Fatalf("expected approval notice to acct-b owner, sent=%#v", *sent)
+	snapshot := sent.Snapshot()
+	if len(snapshot) == 0 || snapshot[0].accountID != "acct-b" {
+		t.Fatalf("expected approval notice to acct-b owner, sent=%#v", snapshot)
 	}
 }
 
@@ -269,8 +291,9 @@ func TestSubmitOwnerTaskAutoDelegatesBySpecialization(t *testing.T) {
 	if !found {
 		t.Fatalf("expected auto-delegation-selected audit, got %#v", audit)
 	}
-	if len(*sent) == 0 || (*sent)[0].accountID != "acct-b" {
-		t.Fatalf("expected approval notice to acct-b owner, sent=%#v", *sent)
+	snapshot := sent.Snapshot()
+	if len(snapshot) == 0 || snapshot[0].accountID != "acct-b" {
+		t.Fatalf("expected approval notice to acct-b owner, sent=%#v", snapshot)
 	}
 }
 
