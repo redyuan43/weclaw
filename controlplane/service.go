@@ -20,6 +20,7 @@ type Service struct {
 	chat                ChatFunc
 	sendText            SendTextFunc
 	mu                  sync.RWMutex
+	taskMu              sync.Mutex
 	knownAccounts       map[string]struct{}
 	availableBaseAgents []string
 }
@@ -884,6 +885,9 @@ func (s *Service) CreateDelegation(ctx context.Context, sourceAccountID, request
 }
 
 func (s *Service) ApproveGrant(ctx context.Context, approvalID, resolvedBy string) (*AuthorizationGrant, error) {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+
 	grant, err := s.store.GetApproval(approvalID)
 	if err != nil {
 		return nil, err
@@ -895,11 +899,8 @@ func (s *Service) ApproveGrant(ctx context.Context, approvalID, resolvedBy strin
 		return grant, nil
 	}
 
-	grant.Status = ApprovalStatusApproved
-	grant.ResolvedReason = strings.TrimSpace(resolvedBy)
-	grant.ResolvedAt = nowString()
-	if err := s.store.PutApproval(grant); err != nil {
-		return nil, err
+	if !s.canResolveGrant(grant, resolvedBy) {
+		return nil, fmt.Errorf("审批失败：只有指定审批人才能批准这个请求喵。")
 	}
 
 	parentTask, err := s.store.GetTask(grant.TaskID, 50)
@@ -909,6 +910,29 @@ func (s *Service) ApproveGrant(ctx context.Context, approvalID, resolvedBy strin
 	if parentTask == nil {
 		return nil, fmt.Errorf("授权关联任务不存在: %s", grant.TaskID)
 	}
+	if parentTask.Status == TaskStatusCanceled {
+		return nil, fmt.Errorf("任务已取消，不能再批准这个审批喵。")
+	}
+
+	resolvedReason := strings.TrimSpace(resolvedBy)
+	resolvedAt := nowString()
+	updated, err := s.store.TransitionApproval(grant.ID, ApprovalStatusPending, ApprovalStatusApproved, resolvedReason, resolvedAt)
+	if err != nil {
+		return nil, err
+	}
+	if !updated {
+		latest, latestErr := s.store.GetApproval(approvalID)
+		if latestErr != nil {
+			return nil, latestErr
+		}
+		if latest != nil {
+			return latest, nil
+		}
+		return nil, fmt.Errorf("审批状态已变化，请刷新后重试喵。")
+	}
+	grant.Status = ApprovalStatusApproved
+	grant.ResolvedReason = resolvedReason
+	grant.ResolvedAt = resolvedAt
 	parentTask.Status = TaskStatusWorking
 	if err := s.store.PutTask(parentTask); err != nil {
 		return nil, err
@@ -960,7 +984,10 @@ func (s *Service) ApproveGrant(ctx context.Context, approvalID, resolvedBy strin
 	return grant, nil
 }
 
-func (s *Service) RejectGrant(ctx context.Context, approvalID, reason string) (*AuthorizationGrant, error) {
+func (s *Service) RejectGrant(ctx context.Context, approvalID, rejectedBy, reason string) (*AuthorizationGrant, error) {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+
 	grant, err := s.store.GetApproval(approvalID)
 	if err != nil {
 		return nil, err
@@ -972,22 +999,41 @@ func (s *Service) RejectGrant(ctx context.Context, approvalID, reason string) (*
 		return grant, nil
 	}
 
-	grant.Status = ApprovalStatusRejected
-	grant.ResolvedReason = strings.TrimSpace(reason)
-	grant.ResolvedAt = nowString()
-	if err := s.store.PutApproval(grant); err != nil {
+	if !s.canResolveGrant(grant, rejectedBy) {
+		return nil, fmt.Errorf("拒绝失败：只有指定审批人才能拒绝这个请求喵。")
+	}
+
+	resolvedReason := strings.TrimSpace(reason)
+	resolvedAt := nowString()
+	updated, err := s.store.TransitionApproval(grant.ID, ApprovalStatusPending, ApprovalStatusRejected, resolvedReason, resolvedAt)
+	if err != nil {
 		return nil, err
 	}
+	if !updated {
+		latest, latestErr := s.store.GetApproval(approvalID)
+		if latestErr != nil {
+			return nil, latestErr
+		}
+		if latest != nil {
+			return latest, nil
+		}
+		return nil, fmt.Errorf("审批状态已变化，请刷新后重试喵。")
+	}
+	grant.Status = ApprovalStatusRejected
+	grant.ResolvedReason = resolvedReason
+	grant.ResolvedAt = resolvedAt
 
 	parentTask, err := s.store.GetTask(grant.TaskID, 50)
 	if err != nil {
 		return nil, err
 	}
 	if parentTask != nil {
-		parentTask.Status = TaskStatusRejected
-		parentTask.ErrorText = firstNonEmpty(strings.TrimSpace(reason), "授权被拒绝")
-		if err := s.store.PutTask(parentTask); err != nil {
-			return nil, err
+		if parentTask.Status != TaskStatusCanceled {
+			parentTask.Status = TaskStatusRejected
+			parentTask.ErrorText = firstNonEmpty(strings.TrimSpace(reason), "授权被拒绝")
+			if err := s.store.PutTask(parentTask); err != nil {
+				return nil, err
+			}
 		}
 		_ = s.store.AppendTaskHistory(AppendHistoryInput{
 			TaskID:         parentTask.ID,
@@ -1012,6 +1058,10 @@ func (s *Service) RejectGrant(ctx context.Context, approvalID, reason string) (*
 
 func (s *Service) ListTasks(limit int) ([]TaskRecord, error) {
 	return s.store.ListTasks(limit)
+}
+
+func (s *Service) ListTasksForAccount(accountID string, limit int) ([]TaskRecord, error) {
+	return s.store.ListTasksForAccount(accountID, limit)
 }
 
 func (s *Service) ListApprovals(status string, limit int) ([]AuthorizationGrant, error) {
@@ -1050,7 +1100,9 @@ func (s *Service) HandleJSONRPC(ctx context.Context, targetAccountID string, req
 			if params.Configuration.HistoryLength > 0 {
 				historyLength = params.Configuration.HistoryLength
 			}
-			blocking = params.Configuration.Blocking
+			if params.Configuration.Blocking != nil {
+				blocking = *params.Configuration.Blocking
+			}
 		}
 
 		if delegateTo != "" && delegateTo != targetAccountID {
@@ -1128,6 +1180,9 @@ func (s *Service) HandleJSONRPC(ctx context.Context, targetAccountID string, req
 		if task == nil {
 			return nil, fmt.Errorf("task not found: %s", params.ID)
 		}
+		if !s.taskVisibleToAccount(task, targetAccountID) {
+			return nil, fmt.Errorf("task not found: %s", params.ID)
+		}
 		return s.taskToA2ATask(task), nil
 
 	case "tasks/cancel":
@@ -1135,11 +1190,16 @@ func (s *Service) HandleJSONRPC(ctx context.Context, targetAccountID string, req
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			return nil, err
 		}
+		s.taskMu.Lock()
+		defer s.taskMu.Unlock()
 		task, err := s.store.GetTask(params.ID, 50)
 		if err != nil {
 			return nil, err
 		}
 		if task == nil {
+			return nil, fmt.Errorf("task not found: %s", params.ID)
+		}
+		if !s.taskVisibleToAccount(task, targetAccountID) {
 			return nil, fmt.Errorf("task not found: %s", params.ID)
 		}
 		if !isTerminalStatus(task.Status) {
@@ -1179,6 +1239,14 @@ func (s *Service) processDelegatedTask(parentTaskID, childTaskID string) {
 	}
 
 	if err != nil {
+		s.taskMu.Lock()
+		defer s.taskMu.Unlock()
+
+		latestParent, latestErr := s.store.GetTask(parentTaskID, 50)
+		if latestErr != nil || latestParent == nil || latestParent.Status == TaskStatusCanceled {
+			return
+		}
+		parentTask = latestParent
 		parentTask.Status = TaskStatusFailed
 		parentTask.ErrorText = err.Error()
 		_ = s.store.PutTask(parentTask)
@@ -1193,6 +1261,14 @@ func (s *Service) processDelegatedTask(parentTaskID, childTaskID string) {
 		return
 	}
 
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+
+	latestParent, latestErr := s.store.GetTask(parentTaskID, 50)
+	if latestErr != nil || latestParent == nil || latestParent.Status == TaskStatusCanceled {
+		return
+	}
+	parentTask = latestParent
 	parentTask.Status = TaskStatusCompleted
 	parentTask.ResultText = fmt.Sprintf("来自 %s 的协作结果：\n%s", firstNonEmpty(profile.DisplayName, profile.AccountID), updatedChild.ResultText)
 	parentTask.AssignedAgentName = updatedChild.AssignedAgentName
@@ -1243,6 +1319,16 @@ func (s *Service) processLocalTask(ctx context.Context, profile *UserAgentProfil
 
 	result, err := s.chat(ctx, task.ContextID, task.RequestText, profile.BaseAgentName)
 	if err != nil {
+		s.taskMu.Lock()
+		defer s.taskMu.Unlock()
+
+		latestTask, latestErr := s.store.GetTask(task.ID, 50)
+		if latestErr == nil && latestTask != nil {
+			task = latestTask
+		}
+		if task.Status == TaskStatusCanceled {
+			return task, err
+		}
 		task.Status = TaskStatusFailed
 		task.ErrorText = err.Error()
 		_ = s.store.PutTask(task)
@@ -1263,6 +1349,17 @@ func (s *Service) processLocalTask(ctx context.Context, profile *UserAgentProfil
 			_ = s.notifyRequester(context.Background(), task, fmt.Sprintf("任务失败：%v", err))
 		}
 		return task, err
+	}
+
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+
+	latestTask, latestErr := s.store.GetTask(task.ID, 50)
+	if latestErr == nil && latestTask != nil {
+		task = latestTask
+	}
+	if task.Status == TaskStatusCanceled {
+		return task, nil
 	}
 
 	task.Status = TaskStatusCompleted
@@ -1453,6 +1550,32 @@ func (s *Service) userServiceURL(accountID string) string {
 		return "/a2a/users/" + url.PathEscape(accountID)
 	}
 	return s.publicBaseURL + "/a2a/users/" + url.PathEscape(accountID)
+}
+
+func (s *Service) canResolveGrant(grant *AuthorizationGrant, actor string) bool {
+	actor = strings.TrimSpace(actor)
+	if grant == nil || actor == "" {
+		return false
+	}
+	if actor == "console" {
+		return true
+	}
+	if actor == grant.ApproverAccountID {
+		return true
+	}
+	profile, err := s.store.GetProfile(grant.ApproverAccountID)
+	if err != nil || profile == nil {
+		return false
+	}
+	return strings.TrimSpace(profile.OwnerContactID) != "" && strings.TrimSpace(profile.OwnerContactID) == actor
+}
+
+func (s *Service) taskVisibleToAccount(task *TaskRecord, accountID string) bool {
+	accountID = strings.TrimSpace(accountID)
+	if task == nil || accountID == "" {
+		return false
+	}
+	return task.RequesterAccountID == accountID || task.TargetAccountID == accountID || task.OwnerAccountID == accountID
 }
 
 func firstNonEmpty(values ...string) string {

@@ -69,7 +69,7 @@ type MessageSendParams struct {
 type MessageSendConfiguration struct {
 	AcceptedOutputModes []string `json:"acceptedOutputModes,omitempty"`
 	HistoryLength       int      `json:"historyLength,omitempty"`
-	Blocking            bool     `json:"blocking,omitempty"`
+	Blocking            *bool    `json:"blocking,omitempty"`
 }
 
 type TaskQueryParams struct {

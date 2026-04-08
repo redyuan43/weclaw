@@ -318,7 +318,7 @@ func TestRejectGrantHistoryUsesShortApprovalCode(t *testing.T) {
 		t.Fatalf("create delegation: %v", err)
 	}
 
-	if _, err := service.RejectGrant(context.Background(), grant.ID, "先不处理"); err != nil {
+	if _, err := service.RejectGrant(context.Background(), grant.ID, "owner-b", "先不处理"); err != nil {
 		t.Fatalf("reject grant: %v", err)
 	}
 
@@ -345,6 +345,68 @@ func TestRejectGrantHistoryUsesShortApprovalCode(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("approval-rejected history not found: %#v", parent.History)
+	}
+}
+
+func TestApproveGrantRejectsUnauthorizedApprover(t *testing.T) {
+	_, service, _ := newTestService(t)
+
+	_, grant, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "请帮我完成跨账号任务")
+	if err != nil {
+		t.Fatalf("create delegation: %v", err)
+	}
+
+	if _, err := service.ApproveGrant(context.Background(), grant.ID, "owner-a"); err == nil {
+		t.Fatal("ApproveGrant should reject unrelated approver")
+	}
+	if _, err := service.RejectGrant(context.Background(), grant.ID, "owner-a", "先不处理"); err == nil {
+		t.Fatal("RejectGrant should reject unrelated approver")
+	}
+}
+
+func TestHandleJSONRPCHidesTasksFromNonParticipants(t *testing.T) {
+	_, service, _ := newTestService(t)
+	if err := service.SyncAccounts(map[string]string{
+		"acct-a": "owner-a",
+		"acct-b": "owner-b",
+		"acct-c": "owner-c",
+	}, "codex"); err != nil {
+		t.Fatalf("sync extra account: %v", err)
+	}
+
+	task, err := service.store.CreateTask(CreateTaskInput{
+		ID:                 "task-private",
+		ContextID:          "ctx-private",
+		RequesterAccountID: "acct-a",
+		RequesterContactID: "owner-a",
+		TargetAccountID:    "acct-b",
+		OwnerAccountID:     "acct-b",
+		Status:             TaskStatusSubmitted,
+		TaskKind:           "a2a_message",
+		Title:              "private",
+		RequestText:        "private task",
+		Blocking:           true,
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	_, err = service.HandleJSONRPC(context.Background(), "acct-c", JSONRPCRequest{
+		JSONRPC: "2.0",
+		Method:  "tasks/get",
+		Params:  []byte(fmt.Sprintf(`{"id":%q,"historyLength":5}`, task.ID)),
+	})
+	if err == nil {
+		t.Fatal("tasks/get should reject non-participant account")
+	}
+
+	_, err = service.HandleJSONRPC(context.Background(), "acct-c", JSONRPCRequest{
+		JSONRPC: "2.0",
+		Method:  "tasks/cancel",
+		Params:  []byte(fmt.Sprintf(`{"id":%q}`, task.ID)),
+	})
+	if err == nil {
+		t.Fatal("tasks/cancel should reject non-participant account")
 	}
 }
 

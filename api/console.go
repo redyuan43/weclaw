@@ -1096,7 +1096,7 @@ func (s *Server) handleConsoleAction(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case len(parts) == 3 && parts[0] == "approvals" && parts[2] == "reject":
-		if _, err := s.userAgents.RejectGrant(r.Context(), parts[1], r.FormValue("reason")); err != nil {
+		if _, err := s.userAgents.RejectGrant(r.Context(), parts[1], "console", r.FormValue("reason")); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

@@ -186,22 +186,23 @@ func (s *BridgeTaskStore) Save(task *BridgeTask) {
 	if task == nil {
 		return
 	}
+	cloned := cloneBridgeTask(task)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[task.TaskID] = task
-	if task.ReplyUserID != "" && task.Status == BridgeTaskWaitingLocalUser {
-		s.pendingByUser[task.ReplyUserID] = task.TaskID
+	s.tasks[cloned.TaskID] = cloned
+	if cloned.ReplyUserID != "" && cloned.Status == BridgeTaskWaitingLocalUser {
+		s.pendingByUser[cloned.ReplyUserID] = cloned.TaskID
 		return
 	}
-	if task.ReplyUserID != "" && s.pendingByUser[task.ReplyUserID] == task.TaskID {
-		delete(s.pendingByUser, task.ReplyUserID)
+	if cloned.ReplyUserID != "" && s.pendingByUser[cloned.ReplyUserID] == cloned.TaskID {
+		delete(s.pendingByUser, cloned.ReplyUserID)
 	}
 }
 
 func (s *BridgeTaskStore) Get(taskID string) *BridgeTask {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.tasks[taskID]
+	return cloneBridgeTask(s.tasks[taskID])
 }
 
 func (s *BridgeTaskStore) PendingForUser(userID string) *BridgeTask {
@@ -211,7 +212,7 @@ func (s *BridgeTaskStore) PendingForUser(userID string) *BridgeTask {
 	if taskID == "" {
 		return nil
 	}
-	return s.tasks[taskID]
+	return cloneBridgeTask(s.tasks[taskID])
 }
 
 func (r *BridgeRuntime) NormalizeIncomingText(text string) (string, bool) {
@@ -451,16 +452,15 @@ func (r *BridgeRuntime) processTaskAsync(task *BridgeTask) {
 		return
 	}
 	r.logf(task, "queueing async processing")
-	go func(taskID string) {
-		task := r.store.Get(taskID)
-		if task == nil {
-			log.Printf("[bridge] task=%s missing before async processing", taskID)
-			return
-		}
-		if _, err := r.processTask(context.Background(), task); err != nil {
-			r.logf(task, "async processing error: %v", err)
-		}
-	}(task.TaskID)
+	taskID := task.TaskID
+	task = r.store.Get(taskID)
+	if task == nil {
+		log.Printf("[bridge] task=%s missing before async processing", taskID)
+		return
+	}
+	if _, err := r.processTask(context.Background(), task); err != nil {
+		r.logf(task, "async processing error: %v", err)
+	}
 }
 
 func (r *BridgeRuntime) decide(ctx context.Context, task *BridgeTask) (BridgeDecision, error) {
@@ -684,9 +684,8 @@ func (r *BridgeRuntime) applyDecision(ctx context.Context, task *BridgeTask, dec
 
 		task.PeerNodeID = targetNode
 		task.Metadata["context_token"] = ""
-		if task.Status == BridgeTaskCompleted || task.Status == BridgeTaskFailed {
-			r.store.Save(task)
-			r.logf(task, "preserving task status=%s after synchronous peer callback", task.Status)
+		if latest := r.store.Get(task.TaskID); latest != nil && (latest.Status == BridgeTaskCompleted || latest.Status == BridgeTaskFailed) {
+			r.logf(latest, "preserving task status=%s after synchronous peer callback", latest.Status)
 			return "peer", nil
 		}
 		if task.OriginKind == "local_user" && deliveryMode == DeliveryModeDeliverToPeerUser {
@@ -1097,6 +1096,23 @@ func (t *BridgeTask) fail(reason string) {
 func (t *BridgeTask) appendHistory(actor, content string) {
 	t.History = append(t.History, BridgeHistoryEntry{Actor: actor, Content: content})
 	t.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+}
+
+func cloneBridgeTask(task *BridgeTask) *BridgeTask {
+	if task == nil {
+		return nil
+	}
+	cloned := *task
+	if task.Metadata != nil {
+		cloned.Metadata = make(map[string]string, len(task.Metadata))
+		for key, value := range task.Metadata {
+			cloned.Metadata[key] = value
+		}
+	}
+	if task.History != nil {
+		cloned.History = append([]BridgeHistoryEntry(nil), task.History...)
+	}
+	return &cloned
 }
 
 func parseBridgeDecision(raw string) (BridgeDecision, error) {

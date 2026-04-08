@@ -833,6 +833,67 @@ func (s *Store) ListTasks(limit int) ([]TaskRecord, error) {
 	return result, rows.Err()
 }
 
+func (s *Store) ListTasksForAccount(accountID string, limit int) ([]TaskRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(
+		`SELECT id, context_id, requester_account_id, requester_contact_id, target_account_id, owner_account_id,
+		        status, task_kind, title, request_text, result_text, error_text, parent_task_id,
+		        assigned_agent_name, approval_id, blocking, metadata_json, created_at, updated_at
+		 FROM a2a_tasks
+		 WHERE requester_account_id = ? OR target_account_id = ? OR owner_account_id = ?
+		 ORDER BY updated_at DESC
+		 LIMIT ?`,
+		accountID,
+		accountID,
+		accountID,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []TaskRecord
+	for rows.Next() {
+		var (
+			task         TaskRecord
+			blocking     int
+			metadataJSON string
+		)
+		if err := rows.Scan(
+			&task.ID,
+			&task.ContextID,
+			&task.RequesterAccountID,
+			&task.RequesterContactID,
+			&task.TargetAccountID,
+			&task.OwnerAccountID,
+			&task.Status,
+			&task.TaskKind,
+			&task.Title,
+			&task.RequestText,
+			&task.ResultText,
+			&task.ErrorText,
+			&task.ParentTaskID,
+			&task.AssignedAgentName,
+			&task.ApprovalID,
+			&blocking,
+			&metadataJSON,
+			&task.CreatedAt,
+			&task.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		task.Blocking = blocking == 1
+		if err := json.Unmarshal([]byte(metadataJSON), &task.Metadata); err != nil {
+			return nil, err
+		}
+		result = append(result, task)
+	}
+	return result, rows.Err()
+}
+
 func (s *Store) ListChildTasks(parentTaskID string) ([]TaskRecord, error) {
 	rows, err := s.db.Query(
 		`SELECT id, context_id, requester_account_id, requester_contact_id, target_account_id, owner_account_id,
@@ -1009,6 +1070,27 @@ func (s *Store) GetApproval(approvalID string) (*AuthorizationGrant, error) {
 		return nil, err
 	}
 	return &grant, nil
+}
+
+func (s *Store) TransitionApproval(approvalID, expectedStatus, nextStatus, resolvedReason, resolvedAt string) (bool, error) {
+	result, err := s.db.Exec(
+		`UPDATE approvals
+		 SET status = ?, resolved_reason = ?, resolved_at = ?
+		 WHERE id = ? AND status = ?`,
+		nextStatus,
+		resolvedReason,
+		resolvedAt,
+		approvalID,
+		expectedStatus,
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 func (s *Store) ListApprovals(status string, limit int) ([]AuthorizationGrant, error) {

@@ -579,7 +579,7 @@ func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, 
 		return
 
 	case trimmed == "/tasks":
-		tasks, err := h.userAgents.ListTasks(20)
+		tasks, err := h.userAgents.ListTasksForAccount(client.BotID(), 20)
 		if err != nil {
 			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("读取任务失败：%v", err), msg.ContextToken, clientID)
 			return
@@ -625,7 +625,7 @@ func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, 
 		if len(parts) == 2 {
 			reason = strings.TrimSpace(parts[1])
 		}
-		grant, err := h.userAgents.RejectGrant(ctx, approvalID, reason)
+		grant, err := h.userAgents.RejectGrant(ctx, approvalID, msg.FromUserID, reason)
 		if err != nil {
 			_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("拒绝失败：%v", err), msg.ContextToken, clientID)
 			return
@@ -691,7 +691,7 @@ func (h *Handler) handleOwnerIngressCommands(ctx context.Context, client *ilink.
 				continue
 			}
 			if decision.ApprovalAction == "reject" {
-				grant, rejectErr := h.userAgents.RejectGrant(ctx, decision.ApprovalID, decision.ApprovalReason)
+				grant, rejectErr := h.userAgents.RejectGrant(ctx, decision.ApprovalID, msg.FromUserID, decision.ApprovalReason)
 				if rejectErr != nil {
 					replies = append(replies, fmt.Sprintf("拒绝失败：%v", rejectErr))
 					return true, strings.Join(replies, "\n")
@@ -700,7 +700,7 @@ func (h *Handler) handleOwnerIngressCommands(ctx context.Context, client *ilink.
 				continue
 			}
 		default:
-			if len(commands) == 1 {
+			if len(replies) == 0 {
 				return false, ""
 			}
 			replies = append(replies, fmt.Sprintf("未识别命令：%s", command))
