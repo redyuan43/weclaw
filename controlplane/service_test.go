@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -263,4 +264,130 @@ func TestGetTaskDetailBuildsWorkflowGraph(t *testing.T) {
 		t.Fatalf("get task detail after wait: %v", err)
 	}
 	t.Fatalf("task detail did not reach completed state: %#v", detail)
+}
+
+func TestResolveIngressDecisionApprovesUniquePendingApproval(t *testing.T) {
+	_, service, _ := newTestService(t)
+
+	task, _, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "请帮我完成跨账号任务")
+	if err != nil {
+		t.Fatalf("create delegation: %v", err)
+	}
+
+	decision, err := service.ResolveIngressDecision("acct-b", "owner-b", "同意")
+	if err != nil {
+		t.Fatalf("resolve ingress decision: %v", err)
+	}
+	if decision.Kind != IngressDecisionApproval {
+		t.Fatalf("decision.Kind = %q, want approval", decision.Kind)
+	}
+	if decision.ApprovalAction != "approve" {
+		t.Fatalf("decision.ApprovalAction = %q, want approve", decision.ApprovalAction)
+	}
+	if decision.ApprovalID != task.ApprovalID {
+		t.Fatalf("decision.ApprovalID = %q, want %q", decision.ApprovalID, task.ApprovalID)
+	}
+
+	shortID := shortCode(task.ApprovalID)
+	decision, err = service.ResolveIngressDecision("acct-b", "owner-b", "/approve "+shortID)
+	if err != nil {
+		t.Fatalf("resolve ingress decision by short id: %v", err)
+	}
+	if decision.ApprovalID != task.ApprovalID {
+		t.Fatalf("decision.ApprovalID by short id = %q, want %q", decision.ApprovalID, task.ApprovalID)
+	}
+}
+
+func TestResolveIngressDecisionClarifiesMultiplePendingApprovals(t *testing.T) {
+	_, service, _ := newTestService(t)
+
+	if _, _, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "任务一"); err != nil {
+		t.Fatalf("create delegation one: %v", err)
+	}
+	if _, _, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "任务二"); err != nil {
+		t.Fatalf("create delegation two: %v", err)
+	}
+
+	decision, err := service.ResolveIngressDecision("acct-b", "owner-b", "同意")
+	if err != nil {
+		t.Fatalf("resolve ingress decision: %v", err)
+	}
+	if decision.Kind != IngressDecisionClarify {
+		t.Fatalf("decision.Kind = %q, want clarify", decision.Kind)
+	}
+	if decision.ClarificationText == "" {
+		t.Fatal("decision.ClarificationText is empty")
+	}
+	if !strings.Contains(decision.ClarificationText, "批准 第一个") {
+		t.Fatalf("clarification text = %q, want ordinal guidance", decision.ClarificationText)
+	}
+}
+
+func TestResolveIngressDecisionApprovesByOrdinal(t *testing.T) {
+	_, service, _ := newTestService(t)
+
+	taskOne, _, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "任务一")
+	if err != nil {
+		t.Fatalf("create delegation one: %v", err)
+	}
+	taskTwo, _, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "任务二")
+	if err != nil {
+		t.Fatalf("create delegation two: %v", err)
+	}
+
+	decision, err := service.ResolveIngressDecision("acct-b", "owner-b", "批准 第一个")
+	if err != nil {
+		t.Fatalf("resolve ingress decision: %v", err)
+	}
+	if decision.Kind != IngressDecisionApproval || decision.ApprovalAction != "approve" {
+		t.Fatalf("decision = %#v, want approve decision", decision)
+	}
+	if decision.ApprovalID != taskTwo.ApprovalID {
+		t.Fatalf("decision.ApprovalID = %q, want latest %q", decision.ApprovalID, taskTwo.ApprovalID)
+	}
+
+	rejectDecision, err := service.ResolveIngressDecision("acct-b", "owner-b", "拒绝 第二个")
+	if err != nil {
+		t.Fatalf("resolve reject decision: %v", err)
+	}
+	if rejectDecision.Kind != IngressDecisionApproval || rejectDecision.ApprovalAction != "reject" {
+		t.Fatalf("rejectDecision = %#v, want reject decision", rejectDecision)
+	}
+	if rejectDecision.ApprovalID != taskOne.ApprovalID {
+		t.Fatalf("rejectDecision.ApprovalID = %q, want older %q", rejectDecision.ApprovalID, taskOne.ApprovalID)
+	}
+}
+
+func TestExpandIngressCommandsHandlesBatchNaturalLanguage(t *testing.T) {
+	_, service, _ := newTestService(t)
+
+	if _, _, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "任务一"); err != nil {
+		t.Fatalf("create delegation one: %v", err)
+	}
+	if _, _, err := service.CreateDelegation(context.Background(), "acct-a", "owner-a", "acct-b", "任务二"); err != nil {
+		t.Fatalf("create delegation two: %v", err)
+	}
+
+	commands, err := service.ExpandIngressCommands("acct-b", "批准 第一个，其他都拒绝")
+	if err != nil {
+		t.Fatalf("expand ingress commands: %v", err)
+	}
+	if len(commands) != 2 {
+		t.Fatalf("len(commands) = %d, want 2, commands=%#v", len(commands), commands)
+	}
+	if !strings.HasPrefix(commands[0], "/approve ") || !strings.HasPrefix(commands[1], "/reject ") {
+		t.Fatalf("commands = %#v, want approve/reject", commands)
+	}
+}
+
+func TestExpandIngressCommandsSplitsMultipleSlashCommands(t *testing.T) {
+	_, service, _ := newTestService(t)
+
+	commands, err := service.ExpandIngressCommands("acct-b", "/reject aa111111 不批准 /reject bb222222 先不处理")
+	if err != nil {
+		t.Fatalf("expand ingress commands: %v", err)
+	}
+	if len(commands) != 2 {
+		t.Fatalf("len(commands) = %d, want 2, commands=%#v", len(commands), commands)
+	}
 }

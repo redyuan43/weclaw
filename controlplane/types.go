@@ -129,6 +129,41 @@ type OwnerTaskDecision struct {
 	Rationale       string `json:"rationale,omitempty"`
 }
 
+type ActiveContextKind string
+
+const (
+	ActiveContextApproval ActiveContextKind = "approval"
+)
+
+type ActiveContext struct {
+	Kind          ActiveContextKind `json:"kind"`
+	DisplayID     string            `json:"display_id,omitempty"`
+	TaskID        string            `json:"task_id"`
+	ApprovalID    string            `json:"approval_id,omitempty"`
+	Title         string            `json:"title"`
+	Status        string            `json:"status"`
+	WaitingReason string            `json:"waiting_reason,omitempty"`
+	UpdatedAt     string            `json:"updated_at"`
+}
+
+type IngressDecisionKind string
+
+const (
+	IngressDecisionApproval IngressDecisionKind = "approval_reply"
+	IngressDecisionNewTask  IngressDecisionKind = "new_task"
+	IngressDecisionClarify  IngressDecisionKind = "clarify"
+)
+
+type IngressDecision struct {
+	Kind              IngressDecisionKind `json:"kind"`
+	ApprovalID        string              `json:"approval_id,omitempty"`
+	ApprovalAction    string              `json:"approval_action,omitempty"`
+	ApprovalReason    string              `json:"approval_reason,omitempty"`
+	ClarificationText string              `json:"clarification_text,omitempty"`
+	Reason            string              `json:"reason,omitempty"`
+	ActiveContexts    []ActiveContext     `json:"active_contexts,omitempty"`
+}
+
 type ChatFunc func(ctx context.Context, conversationID, message, agentName string) (ChatResult, error)
 
 type SendTextFunc func(ctx context.Context, accountID, toUserID, text, contextToken string) error

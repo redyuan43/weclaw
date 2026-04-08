@@ -188,6 +188,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+			if contextToken == "" {
+				contextToken = handler.ContextTokenForUser(toUserID)
+			}
 			return messaging.SendTextReply(ctx, client, toUserID, text, contextToken, "")
 		},
 	)
@@ -224,6 +227,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 					client, err := selectLocalClient(clientByID, defaultClient, accountID)
 					if err != nil {
 						return err
+					}
+					if contextToken == "" {
+						contextToken = handler.ContextTokenForUser(toUserID)
 					}
 					return messaging.SendTextReply(ctx, client, toUserID, text, contextToken, "")
 				},

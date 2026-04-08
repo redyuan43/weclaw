@@ -34,6 +34,7 @@ type AgentMeta struct {
 // Handler processes incoming WeChat messages and dispatches replies.
 type Handler struct {
 	mu             sync.RWMutex
+	laneMu         sync.Mutex
 	defaultName    string
 	agents         map[string]agent.Agent // name -> running agent
 	agentMetas     []AgentMeta            // all configured agents (for /status)
@@ -50,6 +51,13 @@ type Handler struct {
 	userAgents     *controlplane.Service
 	localTimeout   time.Duration
 	slowReplyDelay time.Duration
+	userLanes      map[string]chan queuedInbound
+}
+
+type queuedInbound struct {
+	ctx    context.Context
+	client *ilink.Client
+	msg    ilink.WeixinMessage
 }
 
 type LocalAgentChatResult struct {
@@ -67,6 +75,7 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 		saveDefault:    saveDefault,
 		localTimeout:   2 * time.Minute,
 		slowReplyDelay: 3 * time.Second,
+		userLanes:      make(map[string]chan queuedInbound),
 	}
 }
 
@@ -93,6 +102,18 @@ func (h *Handler) SetInboxStore(store *InboxStore) {
 
 func (h *Handler) SetUserAgents(service *controlplane.Service) {
 	h.userAgents = service
+}
+
+func (h *Handler) ContextTokenForUser(userID string) string {
+	if userID == "" {
+		return ""
+	}
+	if value, ok := h.contextTokens.Load(userID); ok {
+		if token, ok := value.(string); ok {
+			return token
+		}
+	}
+	return ""
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -295,6 +316,31 @@ func (h *Handler) parseCommand(text string) ([]string, string) {
 
 // HandleMessage processes a single incoming message.
 func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage) {
+	h.enqueueMessage(ctx, client, msg)
+}
+
+func (h *Handler) enqueueMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage) {
+	key := client.BotID() + "|" + msg.FromUserID
+
+	h.laneMu.Lock()
+	lane := h.userLanes[key]
+	if lane == nil {
+		lane = make(chan queuedInbound, 64)
+		h.userLanes[key] = lane
+		go h.runUserLane(key, lane)
+	}
+	h.laneMu.Unlock()
+
+	lane <- queuedInbound{ctx: ctx, client: client, msg: msg}
+}
+
+func (h *Handler) runUserLane(key string, lane chan queuedInbound) {
+	for item := range lane {
+		h.processMessage(item.ctx, item.client, item.msg)
+	}
+}
+
+func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage) {
 	// Only process user messages that are finished
 	if msg.MessageType != ilink.MessageTypeUser {
 		return
@@ -517,6 +563,16 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 }
 
 func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, trimmed, clientID string) {
+	if h.userAgents != nil {
+		commands, expandErr := h.userAgents.ExpandIngressCommands(client.BotID(), trimmed)
+		if expandErr == nil && len(commands) > 0 {
+			if handled, reply := h.handleOwnerIngressCommands(ctx, client, msg, commands); handled {
+				_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+				return
+			}
+		}
+	}
+
 	switch {
 	case trimmed == "/help" || trimmed == "/ua-help":
 		_ = SendTextReply(ctx, client, msg.FromUserID, buildOwnerHelpText(), msg.ContextToken, clientID)
@@ -602,6 +658,60 @@ func (h *Handler) handleOwnerMessage(ctx context.Context, client *ilink.Client, 
 	}
 	reply := fmt.Sprintf("[任务 %s]\n%s", shortTaskID(task.ID), h.userAgents.FormatTaskReply(task))
 	h.sendReplyWithMedia(ctx, client, msg, task.AssignedAgentName, reply, clientID)
+}
+
+func (h *Handler) handleOwnerIngressCommands(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, commands []string) (bool, string) {
+	if h.userAgents == nil || len(commands) == 0 {
+		return false, ""
+	}
+
+	var replies []string
+	for _, command := range commands {
+		decision, err := h.userAgents.ResolveIngressDecision(client.BotID(), msg.FromUserID, command)
+		if err != nil {
+			replies = append(replies, fmt.Sprintf("处理失败：%v", err))
+			return true, strings.Join(replies, "\n")
+		}
+		switch decision.Kind {
+		case controlplane.IngressDecisionClarify:
+			replies = append(replies, decision.ClarificationText)
+			return true, strings.Join(replies, "\n")
+		case controlplane.IngressDecisionApproval:
+			if decision.ApprovalAction == "approve" {
+				resolvedBy := msg.FromUserID
+				if strings.TrimSpace(decision.ApprovalReason) != "" {
+					resolvedBy = decision.ApprovalReason
+				}
+				grant, approveErr := h.userAgents.ApproveGrant(ctx, decision.ApprovalID, resolvedBy)
+				if approveErr != nil {
+					replies = append(replies, fmt.Sprintf("批准失败：%v", approveErr))
+					return true, strings.Join(replies, "\n")
+				}
+				replies = append(replies, fmt.Sprintf("已批准协作请求 %s。", shortTaskID(grant.ID)))
+				continue
+			}
+			if decision.ApprovalAction == "reject" {
+				grant, rejectErr := h.userAgents.RejectGrant(ctx, decision.ApprovalID, decision.ApprovalReason)
+				if rejectErr != nil {
+					replies = append(replies, fmt.Sprintf("拒绝失败：%v", rejectErr))
+					return true, strings.Join(replies, "\n")
+				}
+				replies = append(replies, fmt.Sprintf("已拒绝协作请求 %s。", shortTaskID(grant.ID)))
+				continue
+			}
+		default:
+			if len(commands) == 1 {
+				return false, ""
+			}
+			replies = append(replies, fmt.Sprintf("未识别命令：%s", command))
+			return true, strings.Join(replies, "\n")
+		}
+	}
+
+	if len(replies) == 0 {
+		return false, ""
+	}
+	return true, strings.Join(replies, "\n")
 }
 
 // sendToDefaultAgent sends the message to the default agent and replies.

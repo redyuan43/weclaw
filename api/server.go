@@ -312,7 +312,7 @@ func (s *Server) handleDebugInbound(w http.ResponseWriter, r *http.Request) {
 	if injector == nil {
 		injector = s.handler.HandleMessage
 	}
-	injector(r.Context(), client, msg)
+	injector(context.WithoutCancel(r.Context()), client, msg)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

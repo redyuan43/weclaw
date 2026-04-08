@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -306,6 +307,179 @@ func (s *Service) GetApproval(approvalID string) (*AuthorizationGrant, error) {
 	return s.store.GetApproval(approvalID)
 }
 
+func (s *Service) ListActiveContexts(accountID string, limit int) ([]ActiveContext, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	approvals, err := s.store.ListApprovalsForApprover(accountID, ApprovalStatusPending, limit)
+	if err != nil {
+		return nil, err
+	}
+	contexts := make([]ActiveContext, 0, len(approvals))
+	for _, approval := range approvals {
+		taskTitle := approval.RequestReason
+		if task, taskErr := s.store.GetTask(approval.TaskID, 0); taskErr == nil && task != nil {
+			taskTitle = firstNonEmpty(task.Title, approval.RequestReason)
+		}
+		contexts = append(contexts, ActiveContext{
+			Kind:          ActiveContextApproval,
+			DisplayID:     shortCode(approval.ID),
+			TaskID:        approval.TaskID,
+			ApprovalID:    approval.ID,
+			Title:         taskTitle,
+			Status:        approval.Status,
+			WaitingReason: "等待审批",
+			UpdatedAt:     approval.CreatedAt,
+		})
+	}
+	return contexts, nil
+}
+
+func (s *Service) ResolveIngressDecision(accountID, requesterContactID, text string) (IngressDecision, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return IngressDecision{Kind: IngressDecisionNewTask}, nil
+	}
+
+	activeContexts, err := s.ListActiveContexts(accountID, 10)
+	if err != nil {
+		return IngressDecision{}, err
+	}
+	normalized := normalizeIngressText(trimmed)
+
+	if approvalID, extra, ok := explicitApprovalCommand(trimmed, "/approve"); ok {
+		resolvedID, resolveErr := s.resolveApprovalReference(accountID, approvalID, activeContexts)
+		if resolveErr == nil {
+			return IngressDecision{
+				Kind:           IngressDecisionApproval,
+				ApprovalID:     resolvedID,
+				ApprovalAction: "approve",
+				ApprovalReason: extra,
+				Reason:         "显式审批命令",
+			}, nil
+		}
+		return IngressDecision{
+			Kind:              IngressDecisionClarify,
+			ClarificationText: resolveErr.Error(),
+			Reason:            "审批编号未命中",
+			ActiveContexts:    activeContexts,
+		}, nil
+	}
+	if approvalID, extra, ok := explicitApprovalCommand(trimmed, "/reject"); ok {
+		resolvedID, resolveErr := s.resolveApprovalReference(accountID, approvalID, activeContexts)
+		if resolveErr == nil {
+			return IngressDecision{
+				Kind:           IngressDecisionApproval,
+				ApprovalID:     resolvedID,
+				ApprovalAction: "reject",
+				ApprovalReason: extra,
+				Reason:         "显式拒绝命令",
+			}, nil
+		}
+		return IngressDecision{
+			Kind:              IngressDecisionClarify,
+			ClarificationText: resolveErr.Error(),
+			Reason:            "审批编号未命中",
+			ActiveContexts:    activeContexts,
+		}, nil
+	}
+
+	if action, index, ok := ordinalApprovalReply(normalized); ok {
+		if index <= 0 || index > len(activeContexts) {
+			return IngressDecision{
+				Kind:              IngressDecisionClarify,
+				ClarificationText: buildApprovalClarification(activeContexts),
+				Reason:            "序号超出待审批范围",
+				ActiveContexts:    activeContexts,
+			}, nil
+		}
+		return IngressDecision{
+			Kind:           IngressDecisionApproval,
+			ApprovalID:     activeContexts[index-1].ApprovalID,
+			ApprovalAction: action,
+			Reason:         "按序号命中待审批任务",
+			ActiveContexts: activeContexts,
+		}, nil
+	}
+
+	if looksLikeApprovalReply(normalized) {
+		if len(activeContexts) == 1 {
+			action := "approve"
+			if looksLikeRejectReply(normalized) {
+				action = "reject"
+			}
+			return IngressDecision{
+				Kind:           IngressDecisionApproval,
+				ApprovalID:     activeContexts[0].ApprovalID,
+				ApprovalAction: action,
+				Reason:         "唯一待审批上下文",
+				ActiveContexts: activeContexts,
+			}, nil
+		}
+		if len(activeContexts) > 1 {
+			return IngressDecision{
+				Kind:              IngressDecisionClarify,
+				ClarificationText: buildApprovalClarification(activeContexts),
+				Reason:            "多个待审批任务，拒绝猜测",
+				ActiveContexts:    activeContexts,
+			}, nil
+		}
+	}
+
+	return IngressDecision{
+		Kind:           IngressDecisionNewTask,
+		Reason:         "没有命中活跃上下文",
+		ActiveContexts: activeContexts,
+	}, nil
+}
+
+func (s *Service) ExpandIngressCommands(accountID, text string) ([]string, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	if commands := splitExplicitApprovalCommands(trimmed); len(commands) > 1 {
+		return commands, nil
+	}
+
+	lines := splitNonEmptyLines(trimmed)
+	if len(lines) > 1 {
+		return lines, nil
+	}
+
+	normalized := normalizeIngressText(trimmed)
+	if action, index, ok := ordinalApprovalReply(normalized); ok && strings.Contains(normalized, "其他都拒绝") {
+		activeContexts, err := s.ListActiveContexts(accountID, 10)
+		if err != nil {
+			return nil, err
+		}
+		if len(activeContexts) == 0 {
+			return []string{trimmed}, nil
+		}
+		if index <= 0 || index > len(activeContexts) {
+			return []string{trimmed}, nil
+		}
+
+		var commands []string
+		selected := activeContexts[index-1]
+		if action == "approve" {
+			commands = append(commands, "/approve "+selected.DisplayID)
+		} else {
+			commands = append(commands, "/reject "+selected.DisplayID+" 批量拒绝")
+		}
+		for idx, item := range activeContexts {
+			if idx == index-1 {
+				continue
+			}
+			commands = append(commands, "/reject "+item.DisplayID+" 批量拒绝")
+		}
+		return commands, nil
+	}
+
+	return []string{trimmed}, nil
+}
+
 func (s *Service) FormatTaskReply(task *TaskRecord) string {
 	if task == nil {
 		return ""
@@ -320,7 +494,7 @@ func (s *Service) FormatTaskReply(task *TaskRecord) string {
 			targetLabel = firstNonEmpty(profile.DisplayName, profile.AccountID)
 		}
 		if task.ApprovalID != "" {
-			return fmt.Sprintf("已自动发起协作，正在等待 %s 批准。\n授权编号：%s", targetLabel, task.ApprovalID)
+			return fmt.Sprintf("已自动发起协作，正在等待 %s 批准。\n审批码：%s", targetLabel, shortCode(task.ApprovalID))
 		}
 		return fmt.Sprintf("已自动发起协作，正在等待 %s 批准。", targetLabel)
 	case TaskStatusRejected:
@@ -1122,14 +1296,15 @@ func (s *Service) processLocalTask(ctx context.Context, profile *UserAgentProfil
 }
 
 func (s *Service) notifyApprovalRequest(ctx context.Context, task *TaskRecord, grant *AuthorizationGrant, sourceProfile, targetProfile *UserAgentProfile) error {
+	shortApproval := shortCode(grant.ID)
 	message := fmt.Sprintf(
-		"收到来自 %s 的协作请求。\n任务: %s\n说明: %s\n授权编号: %s\n回复 /approve %s 同意，或 /reject %s 原因 拒绝。",
+		"收到来自 %s 的协作请求。\n任务: %s\n说明: %s\n审批码: %s\n如果当前只有这一条待审批，直接回复“同意”或“拒绝”也可以。\n如果有多条待审批，请回复“批准 第一个”或“拒绝 第二个 原因”。\n也可以发送 /approve %s 或 /reject %s 原因。",
 		firstNonEmpty(sourceProfileName(sourceProfile), grant.RequesterAccountID),
 		task.Title,
 		task.RequestText,
-		grant.ID,
-		grant.ID,
-		grant.ID,
+		shortApproval,
+		shortApproval,
+		shortApproval,
 	)
 	return s.notifyOwner(ctx, targetProfile.AccountID, message)
 }
@@ -1291,6 +1466,210 @@ func firstNonEmpty(values ...string) string {
 
 func normalizeRoutingText(value string) string {
 	return strings.ToLower(strings.TrimSpace(strings.ReplaceAll(value, " ", "")))
+}
+
+func normalizeIngressText(value string) string {
+	replacer := strings.NewReplacer(" ", "", "，", "", ",", "", "。", "", ".", "", "！", "", "!", "", "？", "", "?", "")
+	return strings.ToLower(strings.TrimSpace(replacer.Replace(value)))
+}
+
+func looksLikeApprovalReply(normalized string) bool {
+	return looksLikeApproveReply(normalized) || looksLikeRejectReply(normalized)
+}
+
+func looksLikeApproveReply(normalized string) bool {
+	phrases := []string{"同意", "批准", "可以", "行", "好的", "继续"}
+	for _, phrase := range phrases {
+		if normalized == phrase {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeRejectReply(normalized string) bool {
+	phrases := []string{"拒绝", "不行", "不要", "先不处理", "先不做"}
+	for _, phrase := range phrases {
+		if normalized == phrase {
+			return true
+		}
+	}
+	return false
+}
+
+func explicitApprovalCommand(text, prefix string) (string, string, bool) {
+	if !strings.HasPrefix(strings.TrimSpace(text), prefix) {
+		return "", "", false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), prefix))
+	if payload == "" {
+		return "", "", false
+	}
+	fields := strings.Fields(payload)
+	if len(fields) == 0 {
+		return "", "", false
+	}
+	rest := ""
+	if len(fields) > 1 {
+		rest = strings.TrimSpace(strings.TrimPrefix(payload, fields[0]))
+	}
+	return strings.TrimSpace(fields[0]), rest, true
+}
+
+func buildApprovalClarification(contexts []ActiveContext) string {
+	if len(contexts) == 0 {
+		return "主人，现在没有待审批任务喵。"
+	}
+	var lines []string
+	lines = append(lines, "主人，现在有多个待审批任务，蜜桃喵不敢乱认喵，请明确回复：")
+	for idx, item := range contexts {
+		lines = append(lines, fmt.Sprintf("%d. [%s] %s", idx+1, item.DisplayID, item.Title))
+	}
+	lines = append(lines, "可以直接回复：批准 第一个")
+	lines = append(lines, "或者：拒绝 第二个 原因")
+	lines = append(lines, "也可以发送：/approve 审批码")
+	lines = append(lines, "或者：/reject 审批码 原因")
+	return strings.Join(lines, "\n")
+}
+
+func shortCode(value string) string {
+	if len(value) <= 8 {
+		return value
+	}
+	return value[:8]
+}
+
+func (s *Service) resolveApprovalReference(accountID, ref string, activeContexts []ActiveContext) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", fmt.Errorf("审批失败：请补充审批码喵。")
+	}
+
+	var matches []ActiveContext
+	for _, item := range activeContexts {
+		if item.ApprovalID == ref ||
+			item.DisplayID == ref ||
+			strings.HasPrefix(item.ApprovalID, ref) ||
+			strings.HasPrefix(item.TaskID, ref) {
+			matches = append(matches, item)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0].ApprovalID, nil
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("审批码 %s 命中了多个待审批任务喵，请回复“批准 第一个”这种形式，或者看页面里的审批码。", ref)
+	}
+
+	if approval, err := s.store.GetApproval(ref); err == nil && approval != nil {
+		return approval.ID, nil
+	}
+
+	return "", fmt.Errorf("找不到待审批任务 %s 喵，请看最新的审批提醒或页面上的短审批码。", ref)
+}
+
+func ordinalApprovalReply(normalized string) (string, int, bool) {
+	pairs := map[string]string{
+		"批准第": "approve",
+		"同意第": "approve",
+		"拒绝第": "reject",
+	}
+	for prefix, action := range pairs {
+		if strings.HasPrefix(normalized, prefix) {
+			index := parseOrdinalPrefix(strings.TrimPrefix(normalized, prefix))
+			if index > 0 {
+				return action, index, true
+			}
+		}
+	}
+	return "", 0, false
+}
+
+func parseOrdinalPrefix(value string) int {
+	candidates := []struct {
+		prefix string
+		index  int
+	}{
+		{"一个", 1},
+		{"1个", 1},
+		{"1条", 1},
+		{"一条", 1},
+		{"一", 1},
+		{"二个", 2},
+		{"两个", 2},
+		{"2个", 2},
+		{"2条", 2},
+		{"二条", 2},
+		{"二", 2},
+		{"三个", 3},
+		{"3个", 3},
+		{"3条", 3},
+		{"三条", 3},
+		{"三", 3},
+		{"4个", 4},
+		{"四个", 4},
+		{"4条", 4},
+		{"四条", 4},
+		{"四", 4},
+		{"5个", 5},
+		{"五个", 5},
+		{"5条", 5},
+		{"五条", 5},
+		{"五", 5},
+	}
+	for _, item := range candidates {
+		if strings.HasPrefix(value, item.prefix) {
+			return item.index
+		}
+	}
+	switch value {
+	case "1", "第1个", "第1条":
+		return 1
+	case "2", "第2个", "第2条":
+		return 2
+	case "3", "第3个", "第3条":
+		return 3
+	case "4", "第4个", "第4条":
+		return 4
+	case "5", "第5个", "第5条":
+		return 5
+	}
+	return 0
+}
+
+var explicitApprovalCommandPattern = regexp.MustCompile(`/(approve|reject)\s+`)
+
+func splitExplicitApprovalCommands(text string) []string {
+	indices := explicitApprovalCommandPattern.FindAllStringIndex(text, -1)
+	if len(indices) <= 1 {
+		return nil
+	}
+
+	commands := make([]string, 0, len(indices))
+	for idx, bounds := range indices {
+		start := bounds[0]
+		end := len(text)
+		if idx+1 < len(indices) {
+			end = indices[idx+1][0]
+		}
+		command := strings.TrimSpace(text[start:end])
+		if command != "" {
+			commands = append(commands, command)
+		}
+	}
+	return commands
+}
+
+func splitNonEmptyLines(text string) []string {
+	lines := strings.Split(text, "\n")
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result = append(result, line)
+		}
+	}
+	return result
 }
 
 func tokenMatch(normalizedText, candidate string) bool {

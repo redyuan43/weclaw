@@ -1023,7 +1023,50 @@ func (s *Store) ListApprovals(status string, limit int) ([]AuthorizationGrant, e
 		query += ` WHERE status = ?`
 		args = append(args, status)
 	}
-	query += ` ORDER BY created_at DESC LIMIT ?`
+	query += ` ORDER BY created_at DESC, rowid DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var grants []AuthorizationGrant
+	for rows.Next() {
+		var grant AuthorizationGrant
+		if err := rows.Scan(
+			&grant.ID,
+			&grant.TaskID,
+			&grant.RequesterAccountID,
+			&grant.ApproverAccountID,
+			&grant.Status,
+			&grant.Scope,
+			&grant.RequestReason,
+			&grant.ResolvedReason,
+			&grant.CreatedAt,
+			&grant.ResolvedAt,
+		); err != nil {
+			return nil, err
+		}
+		grants = append(grants, grant)
+	}
+	return grants, rows.Err()
+}
+
+func (s *Store) ListApprovalsForApprover(approverAccountID, status string, limit int) ([]AuthorizationGrant, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `SELECT id, task_id, requester_account_id, approver_account_id, status, scope, request_reason, resolved_reason, created_at, resolved_at
+	          FROM approvals
+	          WHERE approver_account_id = ?`
+	args := []any{approverAccountID}
+	if strings.TrimSpace(status) != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY created_at DESC, rowid DESC LIMIT ?`
 	args = append(args, limit)
 
 	rows, err := s.db.Query(query, args...)
