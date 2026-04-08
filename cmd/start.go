@@ -373,13 +373,14 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 
 	switch agCfg.Type {
 	case "acp":
+		systemPrompt := composeWeclawSystemPrompt(agCfg.SystemPrompt)
 		ag := agent.NewACPAgent(agent.ACPAgentConfig{
 			Command:      agCfg.Command,
 			Args:         agCfg.Args,
 			Cwd:          agCfg.Cwd,
 			Env:          agCfg.Env,
 			Model:        agCfg.Model,
-			SystemPrompt: agCfg.SystemPrompt,
+			SystemPrompt: systemPrompt,
 		})
 		if err := ag.Start(ctx); err != nil {
 			log.Printf("[agent] failed to start ACP agent %q: %v", name, err)
@@ -388,6 +389,7 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 		log.Printf("[agent] started ACP agent: %s (command=%s, type=%s, model=%s)", name, agCfg.Command, agCfg.Type, agCfg.Model)
 		return ag
 	case "cli":
+		systemPrompt := composeWeclawSystemPrompt(agCfg.SystemPrompt)
 		ag := agent.NewCLIAgent(agent.CLIAgentConfig{
 			Name:         name,
 			Command:      agCfg.Command,
@@ -395,7 +397,7 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 			Cwd:          agCfg.Cwd,
 			Env:          agCfg.Env,
 			Model:        agCfg.Model,
-			SystemPrompt: agCfg.SystemPrompt,
+			SystemPrompt: systemPrompt,
 		})
 		log.Printf("[agent] created CLI agent: %s (command=%s, type=%s, model=%s)", name, agCfg.Command, agCfg.Type, agCfg.Model)
 		return ag
@@ -404,12 +406,13 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 			log.Printf("[agent] HTTP agent %q has no endpoint", name)
 			return nil
 		}
+		systemPrompt := composeWeclawSystemPrompt(agCfg.SystemPrompt)
 		ag := agent.NewHTTPAgent(agent.HTTPAgentConfig{
 			Endpoint:     agCfg.Endpoint,
 			APIKey:       agCfg.APIKey,
 			Headers:      agCfg.Headers,
 			Model:        agCfg.Model,
-			SystemPrompt: agCfg.SystemPrompt,
+			SystemPrompt: systemPrompt,
 			MaxHistory:   agCfg.MaxHistory,
 		})
 		log.Printf("[agent] created HTTP agent: %s (endpoint=%s, model=%s)", name, agCfg.Endpoint, agCfg.Model)

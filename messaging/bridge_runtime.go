@@ -126,6 +126,24 @@ type BridgeTask struct {
 	UpdatedAt       string               `json:"updated_at"`
 }
 
+func (t *BridgeTask) clone() *BridgeTask {
+	if t == nil {
+		return nil
+	}
+	clone := *t
+	if t.Metadata != nil {
+		clone.Metadata = make(map[string]string, len(t.Metadata))
+		for k, v := range t.Metadata {
+			clone.Metadata[k] = v
+		}
+	}
+	if t.History != nil {
+		clone.History = make([]BridgeHistoryEntry, len(t.History))
+		copy(clone.History, t.History)
+	}
+	return &clone
+}
+
 const (
 	waitingScopeLocalUserFollowUp = "local_user_follow_up"
 	waitingScopePeerUserProxy     = "peer_user_proxy"
@@ -186,23 +204,23 @@ func (s *BridgeTaskStore) Save(task *BridgeTask) {
 	if task == nil {
 		return
 	}
-	cloned := cloneBridgeTask(task)
+	stored := task.clone()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[cloned.TaskID] = cloned
-	if cloned.ReplyUserID != "" && cloned.Status == BridgeTaskWaitingLocalUser {
-		s.pendingByUser[cloned.ReplyUserID] = cloned.TaskID
+	s.tasks[stored.TaskID] = stored
+	if stored.ReplyUserID != "" && stored.Status == BridgeTaskWaitingLocalUser {
+		s.pendingByUser[stored.ReplyUserID] = stored.TaskID
 		return
 	}
-	if cloned.ReplyUserID != "" && s.pendingByUser[cloned.ReplyUserID] == cloned.TaskID {
-		delete(s.pendingByUser, cloned.ReplyUserID)
+	if stored.ReplyUserID != "" && s.pendingByUser[stored.ReplyUserID] == stored.TaskID {
+		delete(s.pendingByUser, stored.ReplyUserID)
 	}
 }
 
 func (s *BridgeTaskStore) Get(taskID string) *BridgeTask {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return cloneBridgeTask(s.tasks[taskID])
+	return s.tasks[taskID].clone()
 }
 
 func (s *BridgeTaskStore) PendingForUser(userID string) *BridgeTask {
@@ -212,7 +230,7 @@ func (s *BridgeTaskStore) PendingForUser(userID string) *BridgeTask {
 	if taskID == "" {
 		return nil
 	}
-	return cloneBridgeTask(s.tasks[taskID])
+	return s.tasks[taskID].clone()
 }
 
 func (r *BridgeRuntime) NormalizeIncomingText(text string) (string, bool) {
@@ -1096,23 +1114,6 @@ func (t *BridgeTask) fail(reason string) {
 func (t *BridgeTask) appendHistory(actor, content string) {
 	t.History = append(t.History, BridgeHistoryEntry{Actor: actor, Content: content})
 	t.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-}
-
-func cloneBridgeTask(task *BridgeTask) *BridgeTask {
-	if task == nil {
-		return nil
-	}
-	cloned := *task
-	if task.Metadata != nil {
-		cloned.Metadata = make(map[string]string, len(task.Metadata))
-		for key, value := range task.Metadata {
-			cloned.Metadata[key] = value
-		}
-	}
-	if task.History != nil {
-		cloned.History = append([]BridgeHistoryEntry(nil), task.History...)
-	}
-	return &cloned
 }
 
 func parseBridgeDecision(raw string) (BridgeDecision, error) {

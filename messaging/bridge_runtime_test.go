@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,11 +16,60 @@ type testBridgeSend struct {
 }
 
 type testBridgeRecorder struct {
+	mu           sync.Mutex
 	chatReply    string
 	chatCalls    int
 	sendCalls    []testBridgeSend
 	dispatches   []TaskRequest
 	dispatchURLs []string
+}
+
+func (r *testBridgeRecorder) noteChat() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.chatCalls++
+	return r.chatReply
+}
+
+func (r *testBridgeRecorder) addSend(call testBridgeSend) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sendCalls = append(r.sendCalls, call)
+}
+
+func (r *testBridgeRecorder) addDispatch(targetBaseURL string, request TaskRequest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dispatchURLs = append(r.dispatchURLs, targetBaseURL)
+	r.dispatches = append(r.dispatches, request)
+}
+
+func (r *testBridgeRecorder) chatCallCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.chatCalls
+}
+
+func (r *testBridgeRecorder) sendCallSnapshot() []testBridgeSend {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]testBridgeSend, len(r.sendCalls))
+	copy(out, r.sendCalls)
+	return out
+}
+
+func (r *testBridgeRecorder) resetSendCalls() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sendCalls = nil
+}
+
+func (r *testBridgeRecorder) dispatchSnapshot() []TaskRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]TaskRequest, len(r.dispatches))
+	copy(out, r.dispatches)
+	return out
 }
 
 func newTestBridgeRuntime(recorder *testBridgeRecorder) *BridgeRuntime {
@@ -40,11 +90,10 @@ func newTestBridgeRuntime(recorder *testBridgeRecorder) *BridgeRuntime {
 		},
 		BridgeRuntimeDeps{
 			Chat: func(_ context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error) {
-				recorder.chatCalls++
-				return &LocalAgentChatResult{AgentName: "codex", Reply: recorder.chatReply}, nil
+				return &LocalAgentChatResult{AgentName: "codex", Reply: recorder.noteChat()}, nil
 			},
 			SendText: func(_ context.Context, accountID, toUserID, text, contextToken string) error {
-				recorder.sendCalls = append(recorder.sendCalls, testBridgeSend{
+				recorder.addSend(testBridgeSend{
 					accountID:    accountID,
 					toUserID:     toUserID,
 					text:         text,
@@ -53,8 +102,7 @@ func newTestBridgeRuntime(recorder *testBridgeRecorder) *BridgeRuntime {
 				return nil
 			},
 			Dispatch: func(_ context.Context, targetBaseURL string, request TaskRequest) (*TaskResult, error) {
-				recorder.dispatchURLs = append(recorder.dispatchURLs, targetBaseURL)
-				recorder.dispatches = append(recorder.dispatches, request)
+				recorder.addDispatch(targetBaseURL, request)
 				return &TaskResult{
 					TaskID:   request.Envelope.MessageID,
 					Status:   string(BridgeTaskPending),
@@ -93,11 +141,11 @@ func TestBridgeRuntimeSuppressesPrefixedMessages(t *testing.T) {
 	if !result.Accepted || result.Route != "suppressed" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	if recorder.chatCalls != 0 {
-		t.Fatalf("chatCalls = %d, want 0", recorder.chatCalls)
+	if recorder.chatCallCount() != 0 {
+		t.Fatalf("chatCalls = %d, want 0", recorder.chatCallCount())
 	}
-	if len(recorder.sendCalls) != 0 {
-		t.Fatalf("sendCalls = %#v, want none", recorder.sendCalls)
+	if got := recorder.sendCallSnapshot(); len(got) != 0 {
+		t.Fatalf("sendCalls = %#v, want none", got)
 	}
 }
 
@@ -119,20 +167,21 @@ func TestBridgeRuntimeLocalReplyUsesStructuredDecision(t *testing.T) {
 	if !result.Accepted || result.Route != "local" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	if recorder.chatCalls != 1 {
-		t.Fatalf("chatCalls = %d, want 1", recorder.chatCalls)
+	if recorder.chatCallCount() != 1 {
+		t.Fatalf("chatCalls = %d, want 1", recorder.chatCallCount())
 	}
-	if len(recorder.sendCalls) != 1 {
-		t.Fatalf("sendCalls = %#v, want one local reply", recorder.sendCalls)
+	sendCalls := recorder.sendCallSnapshot()
+	if len(sendCalls) != 1 {
+		t.Fatalf("sendCalls = %#v, want one local reply", sendCalls)
 	}
-	if recorder.sendCalls[0].toUserID != "local-user@im.wechat" || recorder.sendCalls[0].text != "本地已处理" {
-		t.Fatalf("unexpected send payload: %#v", recorder.sendCalls[0])
+	if sendCalls[0].toUserID != "local-user@im.wechat" || sendCalls[0].text != "本地已处理" {
+		t.Fatalf("unexpected send payload: %#v", sendCalls[0])
 	}
-	if recorder.sendCalls[0].contextToken != "ctx-1" {
-		t.Fatalf("contextToken = %q, want ctx-1", recorder.sendCalls[0].contextToken)
+	if sendCalls[0].contextToken != "ctx-1" {
+		t.Fatalf("contextToken = %q, want ctx-1", sendCalls[0].contextToken)
 	}
-	if len(recorder.dispatches) != 0 {
-		t.Fatalf("dispatches = %#v, want none", recorder.dispatches)
+	if got := recorder.dispatchSnapshot(); len(got) != 0 {
+		t.Fatalf("dispatches = %#v, want none", got)
 	}
 }
 
@@ -150,20 +199,21 @@ func TestBridgeRuntimeHeuristicRoutesPeerUserAlias(t *testing.T) {
 	if !result.Accepted || result.Route != "peer" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	if recorder.chatCalls != 0 {
-		t.Fatalf("chatCalls = %d, want heuristic path to skip chat", recorder.chatCalls)
+	if recorder.chatCallCount() != 0 {
+		t.Fatalf("chatCalls = %d, want heuristic path to skip chat", recorder.chatCallCount())
 	}
-	if len(recorder.dispatches) != 1 {
-		t.Fatalf("dispatches = %#v, want one peer dispatch", recorder.dispatches)
+	dispatches := recorder.dispatchSnapshot()
+	if len(dispatches) != 1 {
+		t.Fatalf("dispatches = %#v, want one peer dispatch", dispatches)
 	}
-	if recorder.dispatches[0].TaskType != "peer_user_question" {
-		t.Fatalf("taskType = %q, want peer_user_question", recorder.dispatches[0].TaskType)
+	if dispatches[0].TaskType != "peer_user_question" {
+		t.Fatalf("taskType = %q, want peer_user_question", dispatches[0].TaskType)
 	}
-	if recorder.dispatches[0].Payload["question_text"] != "帮我问一下 NX1 晚饭吃什么，告诉我结果" {
-		t.Fatalf("question_text = %#v, want structured question_text", recorder.dispatches[0].Payload["question_text"])
+	if dispatches[0].Payload["question_text"] != "帮我问一下 NX1 晚饭吃什么，告诉我结果" {
+		t.Fatalf("question_text = %#v, want structured question_text", dispatches[0].Payload["question_text"])
 	}
-	if recorder.dispatches[0].Payload["requester_agent_label"] != "MTM" {
-		t.Fatalf("requester_agent_label = %#v, want MTM", recorder.dispatches[0].Payload["requester_agent_label"])
+	if dispatches[0].Payload["requester_agent_label"] != "MTM" {
+		t.Fatalf("requester_agent_label = %#v, want MTM", dispatches[0].Payload["requester_agent_label"])
 	}
 }
 
@@ -187,15 +237,16 @@ func TestBridgeRuntimeDeliverToPeerUserNormalizesToLocalReply(t *testing.T) {
 	if !result.Accepted || result.Route != "queued" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	waitForCondition(t, func() bool { return len(recorder.sendCalls) == 1 })
-	if len(recorder.sendCalls) != 1 {
-		t.Fatalf("sendCalls = %#v, want one local delivery", recorder.sendCalls)
+	waitForCondition(t, func() bool { return len(recorder.sendCallSnapshot()) == 1 })
+	sendCalls := recorder.sendCallSnapshot()
+	if len(sendCalls) != 1 {
+		t.Fatalf("sendCalls = %#v, want one local delivery", sendCalls)
 	}
-	if recorder.sendCalls[0].toUserID != "local-user@im.wechat" || recorder.sendCalls[0].text != "直接回复本地用户" {
-		t.Fatalf("unexpected send payload: %#v", recorder.sendCalls[0])
+	if sendCalls[0].toUserID != "local-user@im.wechat" || sendCalls[0].text != "直接回复本地用户" {
+		t.Fatalf("unexpected send payload: %#v", sendCalls[0])
 	}
-	if len(recorder.dispatches) != 0 {
-		t.Fatalf("dispatches = %#v, want none", recorder.dispatches)
+	if got := recorder.dispatchSnapshot(); len(got) != 0 {
+		t.Fatalf("dispatches = %#v, want none", got)
 	}
 }
 
@@ -219,18 +270,19 @@ func TestBridgeRuntimeAssistAndReturnNormalizesToPeerResult(t *testing.T) {
 	if !result.Accepted || result.Route != "queued" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	waitForCondition(t, func() bool { return len(recorder.dispatches) == 1 })
-	if len(recorder.dispatches) != 1 {
-		t.Fatalf("dispatches = %#v, want one peer_result dispatch", recorder.dispatches)
+	waitForCondition(t, func() bool { return len(recorder.dispatchSnapshot()) == 1 })
+	dispatches := recorder.dispatchSnapshot()
+	if len(dispatches) != 1 {
+		t.Fatalf("dispatches = %#v, want one peer_result dispatch", dispatches)
 	}
-	if recorder.dispatches[0].TaskType != "peer_result" {
-		t.Fatalf("taskType = %q, want peer_result", recorder.dispatches[0].TaskType)
+	if dispatches[0].TaskType != "peer_result" {
+		t.Fatalf("taskType = %q, want peer_result", dispatches[0].TaskType)
 	}
-	if recorder.dispatches[0].Payload["text"] != "处理好了" {
-		t.Fatalf("payload text = %#v, want 处理好了", recorder.dispatches[0].Payload["text"])
+	if dispatches[0].Payload["text"] != "处理好了" {
+		t.Fatalf("payload text = %#v, want 处理好了", dispatches[0].Payload["text"])
 	}
-	if len(recorder.sendCalls) != 0 {
-		t.Fatalf("sendCalls = %#v, want none", recorder.sendCalls)
+	if got := recorder.sendCallSnapshot(); len(got) != 0 {
+		t.Fatalf("sendCalls = %#v, want none", got)
 	}
 }
 
@@ -254,7 +306,7 @@ func TestBridgeRuntimeAssistAndReturnRoundTrip(t *testing.T) {
 		},
 		BridgeRuntimeDeps{
 			Chat: func(_ context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error) {
-				recorderA.chatCalls++
+				recorderA.noteChat()
 				reply := `{"action":"reply_local_user","message":"B 端已经拿到结果 #ROUNDTRIP-1","target_node":null,"rationale":"resume-finalize","follow_up_needed":false}`
 				if !strings.Contains(message, "B 端已经拿到结果 #ROUNDTRIP-1") {
 					reply = `{"action":"send_to_peer_agent","message":"请帮我问一下#ROUNDTRIP-1","target_node":"remote-node","rationale":"delegate","follow_up_needed":false}`
@@ -262,7 +314,7 @@ func TestBridgeRuntimeAssistAndReturnRoundTrip(t *testing.T) {
 				return &LocalAgentChatResult{AgentName: "codex", Reply: reply}, nil
 			},
 			SendText: func(_ context.Context, accountID, toUserID, text, contextToken string) error {
-				recorderA.sendCalls = append(recorderA.sendCalls, testBridgeSend{
+				recorderA.addSend(testBridgeSend{
 					accountID:    accountID,
 					toUserID:     toUserID,
 					text:         text,
@@ -271,8 +323,7 @@ func TestBridgeRuntimeAssistAndReturnRoundTrip(t *testing.T) {
 				return nil
 			},
 			Dispatch: func(ctx context.Context, targetBaseURL string, request TaskRequest) (*TaskResult, error) {
-				recorderA.dispatchURLs = append(recorderA.dispatchURLs, targetBaseURL)
-				recorderA.dispatches = append(recorderA.dispatches, request)
+				recorderA.addDispatch(targetBaseURL, request)
 				return runtimeB.ReceiveRequest(ctx, request)
 			},
 		},
@@ -291,11 +342,11 @@ func TestBridgeRuntimeAssistAndReturnRoundTrip(t *testing.T) {
 		},
 		BridgeRuntimeDeps{
 			Chat: func(_ context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error) {
-				recorderB.chatCalls++
+				recorderB.noteChat()
 				return &LocalAgentChatResult{AgentName: "codex", Reply: `{"action":"reply_local_user","message":"B 端已经拿到结果 #ROUNDTRIP-1","target_node":null,"rationale":"done","follow_up_needed":false}`}, nil
 			},
 			SendText: func(_ context.Context, accountID, toUserID, text, contextToken string) error {
-				recorderB.sendCalls = append(recorderB.sendCalls, testBridgeSend{
+				recorderB.addSend(testBridgeSend{
 					accountID:    accountID,
 					toUserID:     toUserID,
 					text:         text,
@@ -304,8 +355,7 @@ func TestBridgeRuntimeAssistAndReturnRoundTrip(t *testing.T) {
 				return nil
 			},
 			Dispatch: func(ctx context.Context, targetBaseURL string, request TaskRequest) (*TaskResult, error) {
-				recorderB.dispatchURLs = append(recorderB.dispatchURLs, targetBaseURL)
-				recorderB.dispatches = append(recorderB.dispatches, request)
+				recorderB.addDispatch(targetBaseURL, request)
 				return runtimeA.ReceiveRequest(ctx, request)
 			},
 		},
@@ -325,22 +375,23 @@ func TestBridgeRuntimeAssistAndReturnRoundTrip(t *testing.T) {
 	}
 	waitForCondition(t, func() bool {
 		task := runtimeA.store.Get(result.TaskID)
-		return task != nil && task.Status == BridgeTaskCompleted && len(recorderA.sendCalls) == 1
+		return task != nil && task.Status == BridgeTaskCompleted && len(recorderA.sendCallSnapshot()) == 1
 	})
-	if len(recorderA.sendCalls) != 1 {
-		t.Fatalf("A sendCalls = %#v, want exactly one final local reply", recorderA.sendCalls)
+	sendCallsA := recorderA.sendCallSnapshot()
+	if len(sendCallsA) != 1 {
+		t.Fatalf("A sendCalls = %#v, want exactly one final local reply", sendCallsA)
 	}
-	if got := recorderA.sendCalls[0].text; got != "B 端已经拿到结果 #ROUNDTRIP-1" {
+	if got := sendCallsA[0].text; got != "B 端已经拿到结果 #ROUNDTRIP-1" {
 		t.Fatalf("A final reply = %q, want round-trip result", got)
 	}
-	if len(recorderB.sendCalls) != 0 {
-		t.Fatalf("B sendCalls = %#v, want no direct local delivery for assist_and_return", recorderB.sendCalls)
+	if got := recorderB.sendCallSnapshot(); len(got) != 0 {
+		t.Fatalf("B sendCalls = %#v, want no direct local delivery for assist_and_return", got)
 	}
-	if recorderA.chatCalls != 1 {
-		t.Fatalf("A chatCalls = %d, want 1 (resume path only; initial path is heuristic)", recorderA.chatCalls)
+	if recorderA.chatCallCount() != 1 {
+		t.Fatalf("A chatCalls = %d, want 1 (resume path only; initial path is heuristic)", recorderA.chatCallCount())
 	}
-	if recorderB.chatCalls != 1 {
-		t.Fatalf("B chatCalls = %d, want 1", recorderB.chatCalls)
+	if recorderB.chatCallCount() != 1 {
+		t.Fatalf("B chatCalls = %d, want 1", recorderB.chatCallCount())
 	}
 	task := runtimeA.store.Get(result.TaskID)
 	if task == nil {
@@ -374,15 +425,16 @@ func TestBridgeRuntimePeerUserQuestionIsRewrittenByPeerAgent(t *testing.T) {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 
-	waitForCondition(t, func() bool { return len(recorder.sendCalls) == 1 })
-	if got := recorder.sendCalls[0].text; got != "主人，MTM 那边想问你：今天晚上的作业做完了吗？" {
+	waitForCondition(t, func() bool { return len(recorder.sendCallSnapshot()) == 1 })
+	sendCalls := recorder.sendCallSnapshot()
+	if got := sendCalls[0].text; got != "主人，MTM 那边想问你：今天晚上的作业做完了吗？" {
 		t.Fatalf("rewritten question = %q, want B-side rewritten voice", got)
 	}
-	if strings.Contains(recorder.sendCalls[0].text, "问一下NX1") {
-		t.Fatalf("question still contains raw forwarded wording: %q", recorder.sendCalls[0].text)
+	if strings.Contains(sendCalls[0].text, "问一下NX1") {
+		t.Fatalf("question still contains raw forwarded wording: %q", sendCalls[0].text)
 	}
-	if recorder.chatCalls != 1 {
-		t.Fatalf("chatCalls = %d, want 1", recorder.chatCalls)
+	if recorder.chatCallCount() != 1 {
+		t.Fatalf("chatCalls = %d, want 1", recorder.chatCallCount())
 	}
 }
 
@@ -399,7 +451,7 @@ func TestBridgeRuntimePeerUserProxyMetaReplyStaysLocal(t *testing.T) {
 		},
 		BridgeRuntimeDeps{
 			Chat: func(_ context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error) {
-				recorder.chatCalls++
+				recorder.noteChat()
 				if strings.Contains(message, "Allowed kinds: answer_pending_question, clarify_identity_and_reask, new_local_request.") {
 					return &LocalAgentChatResult{
 						AgentName: "codex",
@@ -412,7 +464,7 @@ func TestBridgeRuntimePeerUserProxyMetaReplyStaysLocal(t *testing.T) {
 				}, nil
 			},
 			SendText: func(_ context.Context, accountID, toUserID, text, contextToken string) error {
-				recorder.sendCalls = append(recorder.sendCalls, testBridgeSend{
+				recorder.addSend(testBridgeSend{
 					accountID:    accountID,
 					toUserID:     toUserID,
 					text:         text,
@@ -421,7 +473,7 @@ func TestBridgeRuntimePeerUserProxyMetaReplyStaysLocal(t *testing.T) {
 				return nil
 			},
 			Dispatch: func(_ context.Context, targetBaseURL string, request TaskRequest) (*TaskResult, error) {
-				recorder.dispatches = append(recorder.dispatches, request)
+				recorder.addDispatch(targetBaseURL, request)
 				return &TaskResult{TaskID: request.Envelope.MessageID, Status: "queued", Accepted: true, Detail: "accepted"}, nil
 			},
 		},
@@ -444,8 +496,8 @@ func TestBridgeRuntimePeerUserProxyMetaReplyStaysLocal(t *testing.T) {
 		t.Fatalf("question result = %#v, want accepted", question)
 	}
 
-	waitForCondition(t, func() bool { return len(recorder.sendCalls) == 1 })
-	recorder.sendCalls = nil
+	waitForCondition(t, func() bool { return len(recorder.sendCallSnapshot()) == 1 })
+	recorder.resetSendCalls()
 
 	result, err := runtime.HandleWeClawInbound(context.Background(), WeClawInbound{
 		AccountID:  "bot-remote",
@@ -458,12 +510,13 @@ func TestBridgeRuntimePeerUserProxyMetaReplyStaysLocal(t *testing.T) {
 	if !result.Accepted || result.Route != "clarify" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	waitForCondition(t, func() bool { return len(recorder.sendCalls) == 1 })
-	if got := recorder.sendCalls[0].text; got != "主人，我是幽浮喵，MTM 那边想问你：今天晚上的作业做完了吗？" {
+	waitForCondition(t, func() bool { return len(recorder.sendCallSnapshot()) == 1 })
+	sendCalls := recorder.sendCallSnapshot()
+	if got := sendCalls[0].text; got != "主人，我是幽浮喵，MTM 那边想问你：今天晚上的作业做完了吗？" {
 		t.Fatalf("clarification reply = %q, want local clarification", got)
 	}
-	if len(recorder.dispatches) != 0 {
-		t.Fatalf("dispatches = %#v, want no peer dispatch for meta reply", recorder.dispatches)
+	if got := recorder.dispatchSnapshot(); len(got) != 0 {
+		t.Fatalf("dispatches = %#v, want no peer dispatch for meta reply", got)
 	}
 	pending := runtime.store.PendingForUser("local-user@im.wechat")
 	if pending == nil {
@@ -484,7 +537,7 @@ func TestBridgeRuntimePeerUserProxyAnswerForwardsToPeer(t *testing.T) {
 		},
 		BridgeRuntimeDeps{
 			Chat: func(_ context.Context, conversationID, message, agentName string) (*LocalAgentChatResult, error) {
-				recorder.chatCalls++
+				recorder.noteChat()
 				if strings.Contains(message, "Allowed kinds: answer_pending_question, clarify_identity_and_reask, new_local_request.") {
 					return &LocalAgentChatResult{
 						AgentName: "codex",
@@ -497,7 +550,7 @@ func TestBridgeRuntimePeerUserProxyAnswerForwardsToPeer(t *testing.T) {
 				}, nil
 			},
 			SendText: func(_ context.Context, accountID, toUserID, text, contextToken string) error {
-				recorder.sendCalls = append(recorder.sendCalls, testBridgeSend{
+				recorder.addSend(testBridgeSend{
 					accountID:    accountID,
 					toUserID:     toUserID,
 					text:         text,
@@ -506,7 +559,7 @@ func TestBridgeRuntimePeerUserProxyAnswerForwardsToPeer(t *testing.T) {
 				return nil
 			},
 			Dispatch: func(_ context.Context, targetBaseURL string, request TaskRequest) (*TaskResult, error) {
-				recorder.dispatches = append(recorder.dispatches, request)
+				recorder.addDispatch(targetBaseURL, request)
 				return &TaskResult{TaskID: request.Envelope.MessageID, Status: "queued", Accepted: true, Detail: "accepted"}, nil
 			},
 		},
@@ -529,9 +582,9 @@ func TestBridgeRuntimePeerUserProxyAnswerForwardsToPeer(t *testing.T) {
 	}
 	waitForCondition(t, func() bool {
 		pending := runtime.store.PendingForUser("local-user@im.wechat")
-		return pending != nil && len(recorder.sendCalls) == 1
+		return pending != nil && len(recorder.sendCallSnapshot()) == 1
 	})
-	recorder.sendCalls = nil
+	recorder.resetSendCalls()
 
 	result, err := runtime.HandleWeClawInbound(context.Background(), WeClawInbound{
 		AccountID:  "bot-remote",
@@ -544,15 +597,16 @@ func TestBridgeRuntimePeerUserProxyAnswerForwardsToPeer(t *testing.T) {
 	if !result.Accepted || result.Route != "peer" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	waitForCondition(t, func() bool { return len(recorder.dispatches) == 1 })
-	if recorder.dispatches[0].TaskType != "peer_user_answer" {
-		t.Fatalf("taskType = %q, want peer_user_answer", recorder.dispatches[0].TaskType)
+	waitForCondition(t, func() bool { return len(recorder.dispatchSnapshot()) == 1 })
+	dispatches := recorder.dispatchSnapshot()
+	if dispatches[0].TaskType != "peer_user_answer" {
+		t.Fatalf("taskType = %q, want peer_user_answer", dispatches[0].TaskType)
 	}
-	if recorder.dispatches[0].Payload["text"] != "做完了" {
-		t.Fatalf("forwarded answer = %#v, want 做完了", recorder.dispatches[0].Payload["text"])
+	if dispatches[0].Payload["text"] != "做完了" {
+		t.Fatalf("forwarded answer = %#v, want 做完了", dispatches[0].Payload["text"])
 	}
-	if len(recorder.sendCalls) != 0 {
-		t.Fatalf("sendCalls = %#v, want no local clarification for direct answer", recorder.sendCalls)
+	if got := recorder.sendCallSnapshot(); len(got) != 0 {
+		t.Fatalf("sendCalls = %#v, want no local clarification for direct answer", got)
 	}
 }
 
@@ -565,5 +619,36 @@ func TestInboxStoreFiltersByAfterSeq(t *testing.T) {
 	items := store.List("a", 1, 10)
 	if len(items) != 1 || items[0].Text != "three" {
 		t.Fatalf("unexpected inbox items: %#v", items)
+	}
+}
+
+func TestBridgeTaskStoreReturnsCopies(t *testing.T) {
+	store := NewBridgeTaskStore()
+	task := newLocalBridgeTask("local-node", "local-user@im.wechat", "reply-user@im.wechat", "hello")
+	task.Metadata["waiting_scope"] = waitingScopeLocalUserFollowUp
+	task.appendHistory("local_user", "hello")
+	task.setStatus(BridgeTaskWaitingLocalUser, "ask_local_user")
+	store.Save(task)
+
+	got := store.Get(task.TaskID)
+	if got == nil {
+		t.Fatal("Get returned nil")
+	}
+	got.Status = BridgeTaskCompleted
+	got.Metadata["waiting_scope"] = "mutated"
+	got.History[0].Content = "changed"
+
+	pending := store.PendingForUser(task.ReplyUserID)
+	if pending == nil {
+		t.Fatal("PendingForUser returned nil")
+	}
+	if pending.Status != BridgeTaskWaitingLocalUser {
+		t.Fatalf("status = %q, want %q", pending.Status, BridgeTaskWaitingLocalUser)
+	}
+	if pending.Metadata["waiting_scope"] != waitingScopeLocalUserFollowUp {
+		t.Fatalf("waiting_scope = %q, want %q", pending.Metadata["waiting_scope"], waitingScopeLocalUserFollowUp)
+	}
+	if pending.History[0].Content != "hello" {
+		t.Fatalf("history content = %q, want %q", pending.History[0].Content, "hello")
 	}
 }

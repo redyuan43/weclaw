@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,6 +83,7 @@ func TestHandleBridgeInbound(t *testing.T) {
 		info:  agent.AgentInfo{Name: "codex", Type: "acp", Model: "gpt-5.1-codex-mini", Command: "/usr/bin/codex", PID: 123},
 		reply: `{"action":"reply_local_user","message":"peer ok","target_node":null,"rationale":"r","follow_up_needed":false}`,
 	}
+	var mu sync.Mutex
 	var sentTo string
 	var sentText string
 
@@ -103,8 +105,10 @@ func TestHandleBridgeInbound(t *testing.T) {
 		messaging.BridgeRuntimeDeps{
 			Chat: handler.ChatLocalAgent,
 			SendText: func(_ context.Context, accountID, toUserID, text, contextToken string) error {
+				mu.Lock()
 				sentTo = toUserID
 				sentText = text
+				mu.Unlock()
 				return nil
 			},
 			Dispatch: func(_ context.Context, targetBaseURL string, request messaging.TaskRequest) (*messaging.TaskResult, error) {
@@ -151,13 +155,21 @@ func TestHandleBridgeInbound(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if sentTo == "local-user@im.wechat" && sentText == "peer ok" {
+		mu.Lock()
+		gotTo := sentTo
+		gotText := sentText
+		mu.Unlock()
+		if gotTo == "local-user@im.wechat" && gotText == "peer ok" {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if sentTo != "local-user@im.wechat" || sentText != "peer ok" {
-		t.Fatalf("unexpected local send: to=%q text=%q", sentTo, sentText)
+	mu.Lock()
+	gotTo := sentTo
+	gotText := sentText
+	mu.Unlock()
+	if gotTo != "local-user@im.wechat" || gotText != "peer ok" {
+		t.Fatalf("unexpected local send: to=%q text=%q", gotTo, gotText)
 	}
 }
 
