@@ -123,6 +123,9 @@ weclaw send --to "user_id@im.wechat" --text "Hello from weclaw"
 # Send image
 weclaw send --to "user_id@im.wechat" --media "https://example.com/photo.png"
 
+# Send local file
+weclaw send --to "user_id@im.wechat" --file "/abs/path/report.pdf"
+
 # Send text + image
 weclaw send --to "user_id@im.wechat" --text "Check this out" --media "https://example.com/photo.png"
 
@@ -142,6 +145,11 @@ curl -X POST http://127.0.0.1:18011/api/send \
 curl -X POST http://127.0.0.1:18011/api/send \
   -H "Content-Type: application/json" \
   -d '{"to": "user_id@im.wechat", "media_url": "https://example.com/photo.png"}'
+
+# Send local file
+curl -X POST http://127.0.0.1:18011/api/send \
+  -H "Content-Type: application/json" \
+  -d '{"to": "user_id@im.wechat", "media_path": "/abs/path/report.pdf"}'
 
 # Send text + media
 curl -X POST http://127.0.0.1:18011/api/send \

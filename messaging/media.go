@@ -2,6 +2,8 @@ package messaging
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -44,12 +46,29 @@ func SendMediaFromURL(ctx context.Context, client *ilink.Client, toUserID, media
 
 // SendMediaFromPath reads a local file and sends it as a media message.
 func SendMediaFromPath(ctx context.Context, client *ilink.Client, toUserID, path, contextToken string) error {
+	return SendMediaFromPathAs(ctx, client, toUserID, path, contextToken, "file")
+}
+
+// SendMediaFromPathAs reads a local file and sends it using the requested mode.
+// mode can be "file", "image", or "auto".
+func SendMediaFromPathAs(ctx context.Context, client *ilink.Client, toUserID, path, contextToken, mode string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
 
-	return sendMediaData(ctx, client, toUserID, filepath.Base(path), path, data, inferContentType(path), contextToken)
+	fileName := filepath.Base(path)
+	contentType := inferContentType(path)
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "file":
+		return sendFileData(ctx, client, toUserID, fileName, path, data, contentType, contextToken)
+	case "auto":
+		return sendMediaData(ctx, client, toUserID, fileName, path, data, contentType, contextToken)
+	case "image":
+		return sendTypedMediaData(ctx, client, toUserID, fileName, path, data, contentType, contextToken, ilink.CDNMediaTypeImage, ilink.ItemTypeImage)
+	default:
+		return fmt.Errorf("unsupported media mode: %s", mode)
+	}
 }
 
 func sendMediaData(ctx context.Context, client *ilink.Client, toUserID, fileName, source string, data []byte, contentType, contextToken string) error {
@@ -58,6 +77,13 @@ func sendMediaData(ctx context.Context, client *ilink.Client, toUserID, fileName
 	}
 
 	cdnMediaType, itemType := classifyMedia(contentType, source)
+	return sendTypedMediaData(ctx, client, toUserID, fileName, source, data, contentType, contextToken, cdnMediaType, itemType)
+}
+
+func sendTypedMediaData(ctx context.Context, client *ilink.Client, toUserID, fileName, source string, data []byte, contentType, contextToken string, cdnMediaType int, itemType int) error {
+	if fileName == "" {
+		fileName = "file"
+	}
 
 	log.Printf("[media] uploading %s (%s, %d bytes) for %s", source, contentType, len(data), toUserID)
 
@@ -123,6 +149,60 @@ func sendMediaData(ctx context.Context, client *ilink.Client, toUserID, fileName
 	}
 
 	log.Printf("[media] sent %s to %s from %s", contentType, toUserID, source)
+	return nil
+}
+
+func sendFileData(ctx context.Context, client *ilink.Client, toUserID, fileName, source string, data []byte, contentType, contextToken string) error {
+	if fileName == "" {
+		fileName = "file"
+	}
+
+	log.Printf("[media] uploading local file %s (%s, %d bytes) for %s", source, contentType, len(data), toUserID)
+
+	uploaded, err := UploadFileToCDN(ctx, client, data, toUserID, ilink.CDNMediaTypeFile)
+	if err != nil {
+		return fmt.Errorf("upload local file to CDN: %w", err)
+	}
+
+	hash := md5.Sum(data)
+	media := &ilink.MediaInfo{
+		EncryptQueryParam: uploaded.DownloadParam,
+		AESKey:            AESKeyToBase64(uploaded.AESKeyHex),
+		EncryptType:       1,
+	}
+
+	req := &ilink.SendMessageRequest{
+		Msg: ilink.SendMsg{
+			FromUserID:   client.BotID(),
+			ToUserID:     toUserID,
+			ClientID:     NewClientID(),
+			MessageType:  ilink.MessageTypeBot,
+			MessageState: ilink.MessageStateFinish,
+			ItemList: []ilink.MessageItem{
+				{
+					Type: ilink.ItemTypeFile,
+					FileItem: &ilink.FileItem{
+						Media:    media,
+						FileName: fileName,
+						MD5:      hex.EncodeToString(hash[:]),
+						Len:      fmt.Sprintf("%d", uploaded.FileSize),
+					},
+				},
+			},
+			ContextToken: contextToken,
+		},
+		BaseInfo: ilink.BaseInfo{},
+	}
+
+	resp, err := client.SendMessage(ctx, req)
+	if err != nil {
+		return fmt.Errorf("send local file message: %w", err)
+	}
+	if resp.Ret != 0 {
+		return fmt.Errorf("send local file failed: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
+	}
+
+	log.Printf("[media] sent local file %s to %s from %s", fileName, toUserID, source)
 	return nil
 }
 

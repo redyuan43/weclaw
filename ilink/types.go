@@ -158,6 +158,7 @@ type VideoItem struct {
 type FileItem struct {
 	Media    *MediaInfo `json:"media,omitempty"`
 	FileName string     `json:"file_name,omitempty"`
+	MD5      string     `json:"md5,omitempty"`
 	Len      string     `json:"len,omitempty"` // plaintext size as string
 }
 

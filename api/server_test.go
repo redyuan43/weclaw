@@ -221,3 +221,109 @@ func TestHandleDebugInbound(t *testing.T) {
 		t.Fatalf("voice text = %q", injected.ItemList[0].VoiceItem.Text)
 	}
 }
+
+func TestHandleSendRequiresPayload(t *testing.T) {
+	server := NewServer(nil, "", nil, nil)
+	raw := []byte(`{"to":"owner@im.wechat"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/send", bytes.NewReader(raw))
+	rec := httptest.NewRecorder()
+
+	server.handleSend(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got == "" || !bytes.Contains([]byte(got), []byte(`media_path`)) {
+		t.Fatalf("expected error mentioning media_path/text/media_url, body=%q", got)
+	}
+}
+
+func TestHandleSendRejectsMediaURLAndMediaPath(t *testing.T) {
+	server := NewServer(nil, "", nil, nil)
+	raw := []byte(`{"to":"owner@im.wechat","media_url":"https://example.com/demo.png","media_path":"/tmp/demo.png"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/send", bytes.NewReader(raw))
+	rec := httptest.NewRecorder()
+
+	server.handleSend(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got == "" || !bytes.Contains([]byte(got), []byte(`mutually exclusive`)) {
+		t.Fatalf("expected mutual exclusion error, body=%q", got)
+	}
+}
+
+func TestHandleSendRejectsInvalidMediaMode(t *testing.T) {
+	server := NewServer(nil, "", nil, nil)
+	raw := []byte(`{"to":"owner@im.wechat","media_path":"/tmp/demo.png","media_mode":"weird"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/send", bytes.NewReader(raw))
+	rec := httptest.NewRecorder()
+
+	server.handleSend(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestEffectiveMediaModeDefaultsToFile(t *testing.T) {
+	if got := effectiveMediaMode(SendRequest{}); got != "file" {
+		t.Fatalf("effectiveMediaMode() = %q, want file", got)
+	}
+	if got := effectiveMediaMode(SendRequest{MediaMode: "image"}); got != "image" {
+		t.Fatalf("effectiveMediaMode(image) = %q, want image", got)
+	}
+}
+
+func TestResolveSendContextTokenPrefersRequest(t *testing.T) {
+	handler := messaging.NewHandler(nil, nil)
+	server := NewServer(nil, "", nil, handler)
+
+	token, source := server.resolveSendContextToken(SendRequest{
+		To:           "owner@im.wechat",
+		ContextToken: "ctx-explicit",
+	})
+
+	if token != "ctx-explicit" || source != "request" {
+		t.Fatalf("resolveSendContextToken() = (%q, %q), want (%q, %q)", token, source, "ctx-explicit", "request")
+	}
+}
+
+func TestResolveSendContextTokenFallsBackToHandlerCache(t *testing.T) {
+	handler := messaging.NewHandler(nil, nil)
+	creds := &ilink.Credentials{
+		ILinkBotID: "acct-a@im.bot",
+		BotToken:   "test-token",
+		BaseURL:    "http://127.0.0.1",
+	}
+	client := ilink.NewClient(creds)
+	server := NewServer([]*ilink.Client{client}, "", nil, handler)
+	handler.HandleMessage(context.Background(), client, ilink.WeixinMessage{
+		MessageID:    1,
+		FromUserID:   "owner-a@im.wechat",
+		ToUserID:     "acct-a@im.bot",
+		MessageType:  ilink.MessageTypeUser,
+		MessageState: ilink.MessageStateFinish,
+		ContextToken: "ctx-cached",
+		ItemList: []ilink.MessageItem{
+			{
+				Type: ilink.ItemTypeText,
+				TextItem: &ilink.TextItem{
+					Text: "hello",
+				},
+			},
+		},
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		token, source := server.resolveSendContextToken(SendRequest{To: "owner-a@im.wechat"})
+		if token == "ctx-cached" && source == "handler-cache" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	token, source := server.resolveSendContextToken(SendRequest{To: "owner-a@im.wechat"})
+	t.Fatalf("resolveSendContextToken() = (%q, %q), want (%q, %q)", token, source, "ctx-cached", "handler-cache")
+}

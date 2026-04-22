@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/controlplane"
@@ -54,10 +55,14 @@ func (s *Server) SetDebugMessageInjector(fn func(ctx context.Context, client *il
 
 // SendRequest is the JSON body for POST /api/send.
 type SendRequest struct {
-	AccountID string `json:"account_id,omitempty"`
-	To        string `json:"to"`
-	Text      string `json:"text,omitempty"`
-	MediaURL  string `json:"media_url,omitempty"`
+	AccountID               string `json:"account_id,omitempty"`
+	To                      string `json:"to"`
+	Text                    string `json:"text,omitempty"`
+	MediaURL                string `json:"media_url,omitempty"`
+	MediaPath               string `json:"media_path,omitempty"`
+	MediaMode               string `json:"media_mode,omitempty"`
+	ContextToken            string `json:"context_token,omitempty"`
+	WaitContextTokenSeconds int    `json:"wait_context_token_seconds,omitempty"`
 }
 
 type AgentChatRequest struct {
@@ -122,8 +127,20 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `"to" is required`, http.StatusBadRequest)
 		return
 	}
-	if req.Text == "" && req.MediaURL == "" {
-		http.Error(w, `"text" or "media_url" is required`, http.StatusBadRequest)
+	if req.Text == "" && req.MediaURL == "" && req.MediaPath == "" {
+		http.Error(w, `"text", "media_url", or "media_path" is required`, http.StatusBadRequest)
+		return
+	}
+	if req.MediaURL != "" && req.MediaPath != "" {
+		http.Error(w, `"media_url" and "media_path" are mutually exclusive`, http.StatusBadRequest)
+		return
+	}
+	if req.MediaMode != "" && req.MediaMode != "auto" && req.MediaMode != "image" && req.MediaMode != "file" {
+		http.Error(w, `"media_mode" must be one of: auto, image, file`, http.StatusBadRequest)
+		return
+	}
+	if req.WaitContextTokenSeconds < 0 {
+		http.Error(w, `"wait_context_token_seconds" must be non-negative`, http.StatusBadRequest)
 		return
 	}
 	client, err := s.selectClient(req.AccountID)
@@ -133,15 +150,16 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	contextToken, contextSource := s.resolveSendContextToken(req)
 	if req.Text != "" {
-		if err := messaging.SendTextReply(ctx, client, req.To, req.Text, "", ""); err != nil {
+		if err := messaging.SendTextReply(ctx, client, req.To, req.Text, contextToken, ""); err != nil {
 			log.Printf("[api] send text failed: %v", err)
-			http.Error(w, "send text failed: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "send text failed: "+withContextHint(err.Error(), contextToken, req.To), http.StatusInternalServerError)
 			return
 		}
-		log.Printf("[api] sent text to %s via %s: %q", req.To, client.BotID(), req.Text)
+		log.Printf("[api] sent text to %s via %s (context=%s): %q", req.To, client.BotID(), contextSource, req.Text)
 		for _, imgURL := range messaging.ExtractImageURLs(req.Text) {
-			if err := messaging.SendMediaFromURL(ctx, client, req.To, imgURL, ""); err != nil {
+			if err := messaging.SendMediaFromURL(ctx, client, req.To, imgURL, contextToken); err != nil {
 				log.Printf("[api] send extracted image failed: %v", err)
 			} else {
 				log.Printf("[api] sent extracted image to %s: %s", req.To, imgURL)
@@ -150,16 +168,65 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.MediaURL != "" {
-		if err := messaging.SendMediaFromURL(ctx, client, req.To, req.MediaURL, ""); err != nil {
+		if err := messaging.SendMediaFromURL(ctx, client, req.To, req.MediaURL, contextToken); err != nil {
 			log.Printf("[api] send media failed: %v", err)
-			http.Error(w, "send media failed: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "send media failed: "+withContextHint(err.Error(), contextToken, req.To), http.StatusInternalServerError)
 			return
 		}
-		log.Printf("[api] sent media to %s: %s", req.To, req.MediaURL)
+		log.Printf("[api] sent media to %s (context=%s): %s", req.To, contextSource, req.MediaURL)
+	}
+
+	if req.MediaPath != "" {
+		if err := messaging.SendMediaFromPathAs(ctx, client, req.To, req.MediaPath, contextToken, effectiveMediaMode(req)); err != nil {
+			log.Printf("[api] send media failed: %v", err)
+			http.Error(w, "send media failed: "+withContextHint(err.Error(), contextToken, req.To), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("[api] sent media to %s (context=%s mode=%s): %s", req.To, contextSource, effectiveMediaMode(req), req.MediaPath)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":               "ok",
+		"context_token_source": contextSource,
+	})
+}
+
+func (s *Server) resolveSendContextToken(req SendRequest) (string, string) {
+	token := strings.TrimSpace(req.ContextToken)
+	if token != "" {
+		return token, "request"
+	}
+	if s.handler == nil {
+		return "", "none"
+	}
+	deadline := time.Now().Add(time.Duration(req.WaitContextTokenSeconds) * time.Second)
+	for {
+		token = strings.TrimSpace(s.handler.ContextTokenForUser(req.To))
+		if token != "" {
+			return token, "handler-cache"
+		}
+		if req.WaitContextTokenSeconds <= 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return "", "none"
+}
+
+func effectiveMediaMode(req SendRequest) string {
+	mode := strings.TrimSpace(req.MediaMode)
+	if mode == "" {
+		return "file"
+	}
+	return mode
+}
+
+func withContextHint(message, contextToken, toUserID string) string {
+	if strings.TrimSpace(contextToken) != "" {
+		return message
+	}
+	return fmt.Sprintf("%s (no cached context_token for %s; send the bot a fresh message from that WeChat user and retry)", message, toUserID)
 }
 
 func (s *Server) handleAgentChat(w http.ResponseWriter, r *http.Request) {
