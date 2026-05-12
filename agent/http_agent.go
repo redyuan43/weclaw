@@ -82,6 +82,11 @@ func (a *HTTPAgent) ResetSession(_ context.Context, conversationID string) (stri
 	return "", nil
 }
 
+// UseSession is unsupported for HTTP agents because they keep only local history.
+func (a *HTTPAgent) UseSession(_ context.Context, _ string, _ string) error {
+	return fmt.Errorf("HTTP agents do not support provider sessions")
+}
+
 // Chat sends a message to the OpenAI-compatible API and returns the response.
 func (a *HTTPAgent) Chat(ctx context.Context, conversationID string, message string) (string, error) {
 	a.mu.Lock()

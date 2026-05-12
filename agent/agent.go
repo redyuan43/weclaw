@@ -27,8 +27,12 @@ func (i AgentInfo) String() string {
 	return s
 }
 
-// defaultWorkspace returns ~/.weclaw/workspace as the default working directory.
+// defaultWorkspace returns the process working directory as the default
+// workspace, so running weclaw from a project directory selects that project.
 func defaultWorkspace() string {
+	if dir, err := os.Getwd(); err == nil && dir != "" {
+		return dir
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return os.TempDir()
@@ -86,6 +90,9 @@ type Agent interface {
 	// (ACP mode), or an empty string if the ID will be assigned on next Chat
 	// (CLI mode) or is not applicable (HTTP mode).
 	ResetSession(ctx context.Context, conversationID string) (string, error)
+
+	// UseSession binds an existing provider session/thread to the conversation.
+	UseSession(ctx context.Context, conversationID string, sessionID string) error
 
 	// Info returns metadata about this agent.
 	Info() AgentInfo

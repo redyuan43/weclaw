@@ -256,7 +256,7 @@ func (a *ACPAgent) Start(ctx context.Context) error {
 	log.Printf("[acp] started subprocess (command=%s, pid=%d)", a.command, pid)
 
 	a.scanner = bufio.NewScanner(stdout)
-	a.scanner.Buffer(make([]byte, 0, 4*1024*1024), 4*1024*1024) // 4MB
+	a.scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024)
 	a.started = true
 
 	// Start reading loop
@@ -357,6 +357,56 @@ func (a *ACPAgent) ResetSession(ctx context.Context, conversationID string) (str
 		return "", fmt.Errorf("create new session: %w", err)
 	}
 	return sessionID, nil
+}
+
+// UseSession binds an existing provider session/thread to a conversation.
+func (a *ACPAgent) UseSession(ctx context.Context, conversationID string, sessionID string) error {
+	conversationID = strings.TrimSpace(conversationID)
+	sessionID = strings.TrimSpace(sessionID)
+	if conversationID == "" {
+		return fmt.Errorf("conversation ID is required")
+	}
+	if sessionID == "" {
+		return fmt.Errorf("session ID is required")
+	}
+
+	if a.protocol == protocolCodexAppServer {
+		if !a.started {
+			if err := a.Start(ctx); err != nil {
+				return err
+			}
+		}
+
+		result, err := a.rpc(ctx, "thread/resume", map[string]interface{}{
+			"threadId": sessionID,
+		})
+		if err != nil {
+			return fmt.Errorf("resume thread: %w", err)
+		}
+		var resumeResult struct {
+			Thread struct {
+				ID string `json:"id"`
+			} `json:"thread"`
+		}
+		if err := json.Unmarshal(result, &resumeResult); err != nil {
+			return fmt.Errorf("parse thread/resume result: %w", err)
+		}
+		if resumeResult.Thread.ID == "" {
+			return fmt.Errorf("thread/resume returned empty thread id")
+		}
+
+		a.mu.Lock()
+		a.threads[conversationID] = resumeResult.Thread.ID
+		a.mu.Unlock()
+		log.Printf("[acp] bound conversation to thread (conversation=%s, thread=%s)", conversationID, resumeResult.Thread.ID)
+		return nil
+	}
+
+	a.mu.Lock()
+	a.sessions[conversationID] = sessionID
+	a.mu.Unlock()
+	log.Printf("[acp] bound conversation to session (conversation=%s, session=%s)", conversationID, sessionID)
+	return nil
 }
 
 // Chat sends a message and returns the full response.

@@ -29,6 +29,7 @@ func (f *apiFakeAgent) Chat(_ context.Context, conversationID string, message st
 }
 
 func (f *apiFakeAgent) ResetSession(_ context.Context, _ string) (string, error) { return "", nil }
+func (f *apiFakeAgent) UseSession(_ context.Context, _ string, _ string) error   { return nil }
 func (f *apiFakeAgent) Info() agent.AgentInfo                                    { return f.info }
 func (f *apiFakeAgent) SetCwd(_ string)                                          {}
 

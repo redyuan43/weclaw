@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -52,6 +53,7 @@ type Handler struct {
 	localTimeout   time.Duration
 	slowReplyDelay time.Duration
 	userLanes      map[string]chan queuedInbound
+	sessionBinds   map[string]string // WeChat user ID -> provider session/thread ID
 }
 
 type queuedInbound struct {
@@ -76,6 +78,7 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 		localTimeout:   2 * time.Minute,
 		slowReplyDelay: 3 * time.Second,
 		userLanes:      make(map[string]chan queuedInbound),
+		sessionBinds:   loadSessionBindings(),
 	}
 }
 
@@ -368,7 +371,7 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 		}
 	}
 	ownerMessage := h.userAgents != nil && h.userAgents.IsOwnerContact(client.BotID(), msg.FromUserID)
-	if ownerMessage && strings.TrimSpace(text) != "" {
+	if ownerMessage && strings.TrimSpace(text) != "" && !isBuiltInCommand(strings.TrimSpace(text)) && !h.hasSessionBinding(msg.FromUserID) {
 		log.Printf("[handler] owner message routed to user-agent control plane account=%s from=%s", client.BotID(), msg.FromUserID)
 		h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
 		clientID := NewClientID()
@@ -406,7 +409,7 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 	clientID := NewClientID()
 	trimmed := strings.TrimSpace(text)
 
-	if ownerMessage {
+	if ownerMessage && !isBuiltInCommand(trimmed) && !h.hasSessionBinding(msg.FromUserID) {
 		h.handleOwnerMessage(ctx, client, msg, trimmed, clientID)
 		return
 	}
@@ -452,6 +455,12 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 		return
 	} else if strings.HasPrefix(trimmed, "/cwd") {
 		reply := h.handleCwd(trimmed)
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+		}
+		return
+	} else if strings.HasPrefix(trimmed, "/session") {
+		reply := h.handleSession(ctx, msg.FromUserID, trimmed)
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 		}
@@ -729,6 +738,11 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 	ag := h.getDefaultAgent()
 	var reply string
 	if ag != nil {
+		if sessionID := h.sessionBindingFor(msg.FromUserID); sessionID != "" {
+			if err := ag.UseSession(ctx, msg.FromUserID, sessionID); err != nil {
+				log.Printf("[handler] failed to apply session binding for %s: %v", msg.FromUserID, err)
+			}
+		}
 		chatCtx, cancel := h.withLocalAgentTimeout(ctx)
 		defer cancel()
 		stopNotice := h.startSlowReplyNotice(chatCtx, client, msg)
@@ -1072,6 +1086,128 @@ func (h *Handler) handleCwd(trimmed string) string {
 	return fmt.Sprintf("cwd: %s", absPath)
 }
 
+// handleSession binds the current WeChat conversation to an existing agent session.
+func (h *Handler) handleSession(ctx context.Context, userID string, trimmed string) string {
+	sessionID := strings.TrimSpace(strings.TrimPrefix(trimmed, "/session"))
+	if sessionID == "" {
+		return "Usage: /session <codex-thread-id-or-session-id>"
+	}
+
+	ag := h.getDefaultAgent()
+	if ag == nil {
+		name := ""
+		h.mu.RLock()
+		name = h.defaultName
+		h.mu.RUnlock()
+		if name == "" {
+			return "No agent configured."
+		}
+		var err error
+		ag, err = h.getAgent(ctx, name)
+		if err != nil {
+			log.Printf("[handler] failed to start agent %q for session bind: %v", name, err)
+			return fmt.Sprintf("Failed to start agent %q: %v", name, err)
+		}
+	}
+
+	info := ag.Info()
+	if err := ag.UseSession(ctx, userID, sessionID); err != nil {
+		log.Printf("[handler] bind session failed for %s: %v", userID, err)
+		return fmt.Sprintf("Failed to bind session: %v", err)
+	}
+	if err := h.setSessionBinding(userID, sessionID); err != nil {
+		log.Printf("[handler] failed to persist session binding for %s: %v", userID, err)
+	}
+	if info.Type == "acp" && strings.Contains(filepath.Base(info.Command), "codex") {
+		return fmt.Sprintf("已接入 Codex 会话\n%s", sessionID)
+	}
+	return fmt.Sprintf("已接入%s会话\n%s", info.Name, sessionID)
+}
+
+func (h *Handler) hasSessionBinding(userID string) bool {
+	return h.sessionBindingFor(userID) != ""
+}
+
+func (h *Handler) sessionBindingFor(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return ""
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.sessionBinds[userID]
+}
+
+func (h *Handler) setSessionBinding(userID string, sessionID string) error {
+	userID = strings.TrimSpace(userID)
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == "" || sessionID == "" {
+		return nil
+	}
+
+	h.mu.Lock()
+	h.sessionBinds[userID] = sessionID
+	snapshot := make(map[string]string, len(h.sessionBinds))
+	for key, value := range h.sessionBinds {
+		snapshot[key] = value
+	}
+	h.mu.Unlock()
+
+	return saveSessionBindings(snapshot)
+}
+
+func sessionBindingsPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".weclaw", "session-bindings.json"), nil
+}
+
+func loadSessionBindings() map[string]string {
+	bindings := make(map[string]string)
+	path, err := sessionBindingsPath()
+	if err != nil {
+		return bindings
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[handler] failed to read session bindings: %v", err)
+		}
+		return bindings
+	}
+	if err := json.Unmarshal(data, &bindings); err != nil {
+		log.Printf("[handler] failed to parse session bindings: %v", err)
+		return make(map[string]string)
+	}
+	return bindings
+}
+
+func saveSessionBindings(bindings map[string]string) error {
+	path, err := sessionBindingsPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(bindings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func isBuiltInCommand(trimmed string) bool {
+	return trimmed == "/info" ||
+		trimmed == "/help" ||
+		trimmed == "/new" ||
+		trimmed == "/clear" ||
+		strings.HasPrefix(trimmed, "/cwd") ||
+		strings.HasPrefix(trimmed, "/session")
+}
+
 // buildStatus returns a short status string showing the current default agent.
 func (h *Handler) buildStatus() string {
 	h.mu.RLock()
@@ -1097,6 +1233,7 @@ func buildHelpText() string {
 @a @b msg - Broadcast to multiple agents
 /new or /clear - Start a new session
 /cwd /path - Switch workspace directory
+/session <id> - Attach current chat to an existing agent session
 /info - Show current agent info
 /help - Show this help message
 

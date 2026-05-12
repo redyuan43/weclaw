@@ -95,6 +95,24 @@ func (a *CLIAgent) ResetSession(_ context.Context, conversationID string) (strin
 	return "", nil
 }
 
+// UseSession binds an existing CLI session to a conversation.
+func (a *CLIAgent) UseSession(_ context.Context, conversationID string, sessionID string) error {
+	conversationID = strings.TrimSpace(conversationID)
+	sessionID = strings.TrimSpace(sessionID)
+	if conversationID == "" {
+		return fmt.Errorf("conversation ID is required")
+	}
+	if sessionID == "" {
+		return fmt.Errorf("session ID is required")
+	}
+
+	a.mu.Lock()
+	a.sessions[conversationID] = sessionID
+	a.mu.Unlock()
+	log.Printf("[cli] bound conversation to session (command=%s, conversation=%s, session=%s)", a.command, conversationID, sessionID)
+	return nil
+}
+
 // SetCwd changes the working directory for subsequent CLI invocations.
 func (a *CLIAgent) SetCwd(cwd string) {
 	a.mu.Lock()

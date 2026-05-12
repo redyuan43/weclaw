@@ -30,6 +30,10 @@ func (f *fakeAgent) ResetSession(_ context.Context, _ string) (string, error) {
 	return f.resetSessionID, nil
 }
 
+func (f *fakeAgent) UseSession(_ context.Context, _ string, _ string) error {
+	return nil
+}
+
 func (f *fakeAgent) Info() agent.AgentInfo {
 	return f.info
 }
