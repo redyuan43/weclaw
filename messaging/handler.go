@@ -119,6 +119,13 @@ func (h *Handler) ContextTokenForUser(userID string) string {
 	return ""
 }
 
+func (h *Handler) storeContextToken(client *ilink.Client, msg ilink.WeixinMessage) {
+	h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
+	if err := ilink.SaveContextToken(client.BotID(), msg.FromUserID, msg.ContextToken); err != nil {
+		log.Printf("[handler] failed to save context token for %s: %v", msg.FromUserID, err)
+	}
+}
+
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
 func (h *Handler) cleanSeenMsgs() {
 	cutoff := time.Now().Add(-5 * time.Minute)
@@ -373,7 +380,7 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 	ownerMessage := h.userAgents != nil && h.userAgents.IsOwnerContact(client.BotID(), msg.FromUserID)
 	if ownerMessage && strings.TrimSpace(text) != "" && !isBuiltInCommand(strings.TrimSpace(text)) && !h.hasSessionBinding(msg.FromUserID) {
 		log.Printf("[handler] owner message routed to user-agent control plane account=%s from=%s", client.BotID(), msg.FromUserID)
-		h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
+		h.storeContextToken(client, msg)
 		clientID := NewClientID()
 		h.handleOwnerMessage(ctx, client, msg, strings.TrimSpace(text), clientID)
 		return
@@ -403,7 +410,7 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 	log.Printf("[handler] received from %s: %q", msg.FromUserID, truncate(text, 80))
 
 	// Store context token for this user
-	h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
+	h.storeContextToken(client, msg)
 
 	// Generate a clientID for this reply (used to correlate typing → finish)
 	clientID := NewClientID()
