@@ -2,10 +2,13 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fastclaw-ai/weclaw/agent"
+	"github.com/fastclaw-ai/weclaw/ilink"
 )
 
 type fakeAgent struct {
@@ -15,11 +18,19 @@ type fakeAgent struct {
 	reply          string
 	err            error
 	resetSessionID string
+	wait           <-chan struct{}
 }
 
-func (f *fakeAgent) Chat(_ context.Context, conversationID string, message string) (string, error) {
+func (f *fakeAgent) Chat(ctx context.Context, conversationID string, message string) (string, error) {
 	f.lastConvID = conversationID
 	f.lastMessage = message
+	if f.wait != nil {
+		select {
+		case <-f.wait:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 	if f.err != nil {
 		return "", f.err
 	}
@@ -170,6 +181,75 @@ func TestBuildHelpText(t *testing.T) {
 	if !strings.Contains(text, "/help") {
 		t.Error("help text should mention /help")
 	}
+	if !strings.Contains(text, "/plan") || !strings.Contains(text, "/exec") {
+		t.Error("help text should mention /plan and /exec")
+	}
+}
+
+func TestPlanAndExecAreBuiltInCommands(t *testing.T) {
+	if !isBuiltInCommand("/plan") {
+		t.Fatal("/plan should be a built-in command")
+	}
+	if !isBuiltInCommand("/exec") {
+		t.Fatal("/exec should be a built-in command")
+	}
+	if !isBuiltInCommand("/execute") {
+		t.Fatal("/execute should be a built-in command")
+	}
+}
+
+func TestMessageForUserModeWrapsPlanMode(t *testing.T) {
+	h := newTestHandler()
+	h.setUserMode("user-1", "plan")
+
+	got := h.messageForUserMode("user-1", "请修改文件")
+	if !strings.Contains(got, "当前微信会话处于 Plan Mode") {
+		t.Fatalf("plan prompt missing mode header: %q", got)
+	}
+	if !strings.Contains(got, "不要修改文件") {
+		t.Fatalf("plan prompt missing mutation guard: %q", got)
+	}
+	if !strings.Contains(got, "请修改文件") {
+		t.Fatalf("plan prompt missing original message: %q", got)
+	}
+
+	h.clearUserMode("user-1")
+	if got := h.messageForUserMode("user-1", "请修改文件"); got != "请修改文件" {
+		t.Fatalf("exec mode message = %q, want original", got)
+	}
+}
+
+func TestMessageForUserModeWrapsOwnerConversation(t *testing.T) {
+	h := newTestHandler()
+	h.setUserMode("user-1", "plan")
+
+	got := h.messageForUserMode("owner:account:user-1", "继续执行")
+	if !strings.Contains(got, "Plan Mode") {
+		t.Fatalf("owner conversation message = %q, want plan wrapper", got)
+	}
+	if !strings.Contains(got, "继续执行") {
+		t.Fatalf("owner conversation message = %q, want original text", got)
+	}
+}
+
+func TestChatWithAgentAppliesPlanMode(t *testing.T) {
+	ag := &fakeAgent{
+		info:  agent.AgentInfo{Name: "codex", Type: "acp", Model: "test-model"},
+		reply: "planned",
+	}
+	h := newTestHandler()
+	h.setUserMode("user-1", "plan")
+
+	reply, err := h.chatWithAgent(context.Background(), ag, "user-1", "实现这个功能")
+	if err != nil {
+		t.Fatalf("chatWithAgent returned error: %v", err)
+	}
+	if reply != "planned" {
+		t.Fatalf("reply = %q, want planned", reply)
+	}
+	if !strings.Contains(ag.lastMessage, "Plan Mode") {
+		t.Fatalf("lastMessage = %q, want plan wrapper", ag.lastMessage)
+	}
 }
 
 func TestBuildOwnerHelpTextUsesApprovalCode(t *testing.T) {
@@ -238,5 +318,149 @@ func TestChatLocalAgent_UsesExplicitAgentName(t *testing.T) {
 	}
 	if ag.lastConvID != "a2a:conv-2" {
 		t.Fatalf("conversationID = %q, want a2a:conv-2", ag.lastConvID)
+	}
+}
+
+func TestHandlerClearsMemoryContextOnInvalidContext(t *testing.T) {
+	h := NewHandler(nil, nil)
+	h.contextTokens.Store("owner@im.wechat", "stale-token")
+
+	h.noteSendError(nil, "owner@im.wechat", ErrInvalidContext)
+
+	if got := h.ContextTokenForUser("owner@im.wechat"); got != "" {
+		t.Fatalf("ContextTokenForUser() = %q, want empty", got)
+	}
+}
+
+func TestSendAgentReplyWithBackgroundSendsFinalBeforeForegroundTimeout(t *testing.T) {
+	h := NewHandler(nil, nil)
+	h.localTimeout = 50 * time.Millisecond
+	h.slowReplyDelay = time.Hour
+	h.backgroundTaskTimeout = time.Second
+
+	ag := &fakeAgent{
+		info:  agent.AgentInfo{Name: "codex", Type: "acp"},
+		reply: "done",
+	}
+	var sent []string
+	restore := stubHandlerTextSender(t, func(_ context.Context, _ *ilink.Client, _ string, text string, _ string, _ string) error {
+		sent = append(sent, text)
+		return nil
+	})
+	defer restore()
+
+	h.sendAgentReplyWithBackground(context.Background(), nil, testWeixinMessage(), "codex", ag, "work", "client-1", "")
+
+	if len(sent) != 1 || sent[0] != "done" {
+		t.Fatalf("sent = %#v, want only final reply", sent)
+	}
+}
+
+func TestSendAgentReplyWithBackgroundContinuesAfterForegroundTimeout(t *testing.T) {
+	h := NewHandler(nil, nil)
+	h.localTimeout = 10 * time.Millisecond
+	h.slowReplyDelay = time.Hour
+	h.backgroundTaskTimeout = time.Second
+
+	release := make(chan struct{})
+	ag := &fakeAgent{
+		info:  agent.AgentInfo{Name: "codex", Type: "acp"},
+		reply: "done later",
+		wait:  release,
+	}
+	sentCh := make(chan string, 4)
+	restore := stubHandlerTextSender(t, func(_ context.Context, _ *ilink.Client, _ string, text string, _ string, _ string) error {
+		sentCh <- text
+		return nil
+	})
+	defer restore()
+
+	h.sendAgentReplyWithBackground(context.Background(), nil, testWeixinMessage(), "codex", ag, "work", "client-1", "")
+
+	first := <-sentCh
+	if first != "任务仍在后台执行，完成后会自动发送结果。" {
+		t.Fatalf("first sent = %q, want background notice", first)
+	}
+	close(release)
+
+	select {
+	case got := <-sentCh:
+		if got != "done later" {
+			t.Fatalf("background final = %q, want done later", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for background final reply")
+	}
+}
+
+func TestSendTextReplyWithPendingQueuesInvalidContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	h := NewHandler(nil, nil)
+	restore := stubHandlerTextSender(t, func(context.Context, *ilink.Client, string, string, string, string) error {
+		return ErrInvalidContext
+	})
+	defer restore()
+
+	h.sendTextReplyWithPending(context.Background(), nil, "owner@im.wechat", "final", "stale", "client-1")
+
+	files, err := pendingOutgoingFiles()
+	if err != nil {
+		t.Fatalf("pendingOutgoingFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("pending files = %d, want 1", len(files))
+	}
+	item, err := readPendingOutgoing(files[0])
+	if err != nil {
+		t.Fatalf("readPendingOutgoing: %v", err)
+	}
+	if item.To != "owner@im.wechat" || item.Text != "final" {
+		t.Fatalf("queued item = %#v, want text final to owner", item)
+	}
+}
+
+func TestSendTextReplyWithPendingSkipsPermanentErrors(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	h := NewHandler(nil, nil)
+	restore := stubHandlerTextSender(t, func(context.Context, *ilink.Client, string, string, string, string) error {
+		return errors.New("permission denied")
+	})
+	defer restore()
+
+	h.sendTextReplyWithPending(context.Background(), nil, "owner@im.wechat", "final", "token", "client-1")
+
+	files, err := pendingOutgoingFiles()
+	if err != nil {
+		t.Fatalf("pendingOutgoingFiles: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("pending files = %d, want 0", len(files))
+	}
+}
+
+func testWeixinMessage() ilink.WeixinMessage {
+	return ilink.WeixinMessage{
+		FromUserID:   "owner@im.wechat",
+		ToUserID:     "bot@im.bot",
+		ContextToken: "fresh-token",
+	}
+}
+
+func stubHandlerTextSender(t *testing.T, fn func(context.Context, *ilink.Client, string, string, string, string) error) func() {
+	t.Helper()
+	origText := handlerSendTextReply
+	origURL := handlerSendMediaFromURL
+	origPath := handlerSendMediaFromPath
+	handlerSendTextReply = fn
+	handlerSendMediaFromURL = func(context.Context, *ilink.Client, string, string, string) error {
+		return nil
+	}
+	handlerSendMediaFromPath = func(context.Context, *ilink.Client, string, string, string) error {
+		return nil
+	}
+	return func() {
+		handlerSendTextReply = origText
+		handlerSendMediaFromURL = origURL
+		handlerSendMediaFromPath = origPath
 	}
 }

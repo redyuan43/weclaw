@@ -267,6 +267,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	for _, client := range clients {
+		go messaging.RetryPendingDeliveries(context.Background(), client, "", "")
+	}
+	messaging.StartContextKeepAliveFromEnv(ctx, clients)
+
 	// Start monitors immediately — they will use echo mode until agent is ready
 	log.Printf("Starting message bridge for %d account(s)...", len(accounts))
 

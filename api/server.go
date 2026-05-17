@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/controlplane"
@@ -58,6 +60,7 @@ type SendRequest struct {
 	To        string `json:"to"`
 	Text      string `json:"text,omitempty"`
 	MediaURL  string `json:"media_url,omitempty"`
+	MediaPath string `json:"media_path,omitempty"`
 }
 
 type AgentChatRequest struct {
@@ -122,8 +125,8 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `"to" is required`, http.StatusBadRequest)
 		return
 	}
-	if req.Text == "" && req.MediaURL == "" {
-		http.Error(w, `"text" or "media_url" is required`, http.StatusBadRequest)
+	if req.Text == "" && req.MediaURL == "" && req.MediaPath == "" {
+		http.Error(w, `"text", "media_url", or "media_path" is required`, http.StatusBadRequest)
 		return
 	}
 	client, err := s.selectClient(req.AccountID)
@@ -136,6 +139,9 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if req.Text != "" {
 		if err := messaging.SendTextReply(ctx, client, req.To, req.Text, "", ""); err != nil {
 			log.Printf("[api] send text failed: %v", err)
+			if s.queuePendingSend(w, client, req, req.Text, req.MediaURL, req.MediaPath, err) {
+				return
+			}
 			http.Error(w, "send text failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -152,14 +158,69 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if req.MediaURL != "" {
 		if err := messaging.SendMediaFromURL(ctx, client, req.To, req.MediaURL, ""); err != nil {
 			log.Printf("[api] send media failed: %v", err)
+			if s.queuePendingSend(w, client, req, "", req.MediaURL, req.MediaPath, err) {
+				return
+			}
 			http.Error(w, "send media failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		log.Printf("[api] sent media to %s: %s", req.To, req.MediaURL)
 	}
 
+	if req.MediaPath != "" {
+		if err := messaging.SendMediaFromPath(ctx, client, req.To, req.MediaPath, ""); err != nil {
+			log.Printf("[api] send media path failed: %v", err)
+			if s.queuePendingSend(w, client, req, "", "", req.MediaPath, err) {
+				return
+			}
+			http.Error(w, "send media path failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("[api] sent media to %s: %s", req.To, req.MediaPath)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) queuePendingSend(w http.ResponseWriter, client *ilink.Client, req SendRequest, text, mediaURL, mediaPath string, cause error) bool {
+	if !shouldQueuePendingSend(cause) {
+		return false
+	}
+	accountID := req.AccountID
+	if accountID == "" && client != nil {
+		accountID = client.BotID()
+	}
+	path, err := messaging.SavePendingOutgoingSend(accountID, req.To, text, mediaURL, mediaPath, cause.Error())
+	if err != nil {
+		log.Printf("[api] queue pending send failed: %v", err)
+		return false
+	}
+	if path != "" {
+		log.Printf("[api] queued pending send: %s", path)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "queued",
+		"error":  cause.Error(),
+		"path":   path,
+	})
+	return true
+}
+
+func shouldQueuePendingSend(cause error) bool {
+	if cause == nil {
+		return false
+	}
+	if errors.Is(cause, messaging.ErrInvalidContext) {
+		return true
+	}
+	message := cause.Error()
+	return strings.Contains(message, "ret=-2") ||
+		strings.Contains(message, "CDN upload HTTP 5") ||
+		strings.Contains(message, "context deadline exceeded") ||
+		strings.Contains(message, "EOF")
 }
 
 func (s *Server) handleAgentChat(w http.ResponseWriter, r *http.Request) {

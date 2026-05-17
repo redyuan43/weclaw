@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -220,5 +221,27 @@ func TestHandleDebugInbound(t *testing.T) {
 	}
 	if injected.ItemList[0].VoiceItem.Text != "请帮我测试这条调试消息" {
 		t.Fatalf("voice text = %q", injected.ItemList[0].VoiceItem.Text)
+	}
+}
+
+func TestShouldQueuePendingSend(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "stale context", err: errors.New("send message failed: ret=-2 errmsg="), want: true},
+		{name: "sentinel stale context", err: messaging.ErrInvalidContext, want: true},
+		{name: "cdn server error", err: errors.New("upload to CDN: CDN upload HTTP 500:"), want: true},
+		{name: "timeout", err: context.DeadlineExceeded, want: true},
+		{name: "missing file", err: errors.New("read /tmp/missing.pdf: no such file or directory"), want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldQueuePendingSend(tc.err); got != tc.want {
+				t.Fatalf("shouldQueuePendingSend(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }

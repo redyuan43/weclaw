@@ -126,6 +126,10 @@ func sendMediaData(ctx context.Context, client *ilink.Client, toUserID, fileName
 		return fmt.Errorf("send media message: %w", err)
 	}
 	if resp.Ret != 0 {
+		if resp.Ret == errCodeInvalidContext {
+			clearStaleContextToken(client, toUserID, "media")
+			return invalidContextError("send media", resp.ErrMsg)
+		}
 		return fmt.Errorf("send media failed: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
 	}
 

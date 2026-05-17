@@ -189,7 +189,7 @@ func (h *Handler) handleRichMediaMessage(ctx context.Context, client *ilink.Clie
 }
 
 func (h *Handler) processRichMediaAsync(client *ilink.Client, msg ilink.WeixinMessage, promptText string, req *MediaProcessRequest, knownNames []string) {
-	bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	bgCtx, cancel := h.withBackgroundAgentTimeout()
 	defer cancel()
 
 	if len(knownNames) == 0 {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Send WeChat File"
+  short_description: "Send local files or photos to a WeClaw/ClawBot WeChat contact."
+  default_prompt: "Send this local file to my WeChat contact through WeClaw."

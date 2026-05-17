@@ -34,26 +34,28 @@ type AgentMeta struct {
 
 // Handler processes incoming WeChat messages and dispatches replies.
 type Handler struct {
-	mu             sync.RWMutex
-	laneMu         sync.Mutex
-	defaultName    string
-	agents         map[string]agent.Agent // name -> running agent
-	agentMetas     []AgentMeta            // all configured agents (for /status)
-	agentWorkDirs  map[string]string      // agent name -> configured/runtime cwd
-	customAliases  map[string]string      // custom alias -> agent name (from config)
-	factory        AgentFactory
-	saveDefault    SaveDefaultFunc
-	mediaService   *MediaServiceClient
-	contextTokens  sync.Map // map[userID]contextToken
-	saveDir        string   // directory to save images/files to
-	seenMsgs       sync.Map // map[int64]time.Time — dedup by message_id
-	bridge         *BridgeRuntime
-	inbox          *InboxStore
-	userAgents     *controlplane.Service
-	localTimeout   time.Duration
-	slowReplyDelay time.Duration
-	userLanes      map[string]chan queuedInbound
-	sessionBinds   map[string]string // WeChat user ID -> provider session/thread ID
+	mu                    sync.RWMutex
+	laneMu                sync.Mutex
+	defaultName           string
+	agents                map[string]agent.Agent // name -> running agent
+	agentMetas            []AgentMeta            // all configured agents (for /status)
+	agentWorkDirs         map[string]string      // agent name -> configured/runtime cwd
+	customAliases         map[string]string      // custom alias -> agent name (from config)
+	factory               AgentFactory
+	saveDefault           SaveDefaultFunc
+	mediaService          *MediaServiceClient
+	contextTokens         sync.Map // map[userID]contextToken
+	saveDir               string   // directory to save images/files to
+	seenMsgs              sync.Map // map[int64]time.Time — dedup by message_id
+	bridge                *BridgeRuntime
+	inbox                 *InboxStore
+	userAgents            *controlplane.Service
+	localTimeout          time.Duration
+	backgroundTaskTimeout time.Duration
+	slowReplyDelay        time.Duration
+	userLanes             map[string]chan queuedInbound
+	sessionBinds          map[string]string // WeChat user ID -> provider session/thread ID
+	userModes             sync.Map          // map[userID]string, e.g. "plan"
 }
 
 type queuedInbound struct {
@@ -68,17 +70,29 @@ type LocalAgentChatResult struct {
 	Reply     string
 }
 
+type agentReplyResult struct {
+	reply string
+	err   error
+}
+
+var (
+	handlerSendTextReply     = SendTextReply
+	handlerSendMediaFromURL  = SendMediaFromURL
+	handlerSendMediaFromPath = SendMediaFromPath
+)
+
 // NewHandler creates a new message handler.
 func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 	return &Handler{
-		agents:         make(map[string]agent.Agent),
-		agentWorkDirs:  make(map[string]string),
-		factory:        factory,
-		saveDefault:    saveDefault,
-		localTimeout:   2 * time.Minute,
-		slowReplyDelay: 3 * time.Second,
-		userLanes:      make(map[string]chan queuedInbound),
-		sessionBinds:   loadSessionBindings(),
+		agents:                make(map[string]agent.Agent),
+		agentWorkDirs:         make(map[string]string),
+		factory:               factory,
+		saveDefault:           saveDefault,
+		localTimeout:          2 * time.Minute,
+		backgroundTaskTimeout: time.Hour,
+		slowReplyDelay:        3 * time.Second,
+		userLanes:             make(map[string]chan queuedInbound),
+		sessionBinds:          loadSessionBindings(),
 	}
 }
 
@@ -119,11 +133,31 @@ func (h *Handler) ContextTokenForUser(userID string) string {
 	return ""
 }
 
+func (h *Handler) forgetContextTokenForUser(client *ilink.Client, userID string) {
+	if userID == "" {
+		return
+	}
+	h.contextTokens.Delete(userID)
+	if client != nil {
+		clearStaleContextToken(client, userID, "handler")
+	}
+}
+
+func (h *Handler) noteSendError(client *ilink.Client, userID string, err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, ErrInvalidContext) {
+		h.forgetContextTokenForUser(client, userID)
+	}
+}
+
 func (h *Handler) storeContextToken(client *ilink.Client, msg ilink.WeixinMessage) {
 	h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
 	if err := ilink.SaveContextToken(client.BotID(), msg.FromUserID, msg.ContextToken); err != nil {
 		log.Printf("[handler] failed to save context token for %s: %v", msg.FromUserID, err)
 	}
+	go RetryPendingDeliveries(context.Background(), client, msg.FromUserID, msg.ContextToken)
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -436,6 +470,7 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 			}
 			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+				h.noteSendError(client, msg.FromUserID, err)
 			}
 			return
 		}
@@ -446,30 +481,51 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 		reply := h.buildStatus()
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
 		}
 		return
 	} else if trimmed == "/help" {
 		reply := buildHelpText()
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
+		}
+		return
+	} else if trimmed == "/plan" {
+		h.setUserMode(msg.FromUserID, "plan")
+		reply := "已进入 Plan Mode：后续消息只会要求 Agent 做分析和计划，不执行修改。发送 /exec 恢复执行模式。"
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
+		}
+		return
+	} else if trimmed == "/exec" || trimmed == "/execute" {
+		h.clearUserMode(msg.FromUserID)
+		reply := "已切回执行模式。"
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
 		}
 		return
 	} else if trimmed == "/new" || trimmed == "/clear" {
 		reply := h.resetDefaultSession(ctx, msg.FromUserID)
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
 		}
 		return
 	} else if strings.HasPrefix(trimmed, "/cwd") {
 		reply := h.handleCwd(trimmed)
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
 		}
 		return
 	} else if strings.HasPrefix(trimmed, "/session") {
 		reply := h.handleSession(ctx, msg.FromUserID, trimmed)
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
 		}
 		return
 	}
@@ -536,6 +592,7 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 			reply := h.switchDefault(ctx, agentNames[0])
 			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+				h.noteSendError(client, msg.FromUserID, err)
 			}
 		} else if len(agentNames) == 1 && !h.isKnownAgent(agentNames[0]) {
 			// Unknown agent -> forward to default
@@ -544,6 +601,7 @@ func (h *Handler) processMessage(ctx context.Context, client *ilink.Client, msg 
 			reply := "Usage: specify one agent to switch, or add a message to broadcast"
 			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+				h.noteSendError(client, msg.FromUserID, err)
 			}
 		}
 		return
@@ -743,28 +801,18 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 	h.mu.RUnlock()
 
 	ag := h.getDefaultAgent()
-	var reply string
 	if ag != nil {
 		if sessionID := h.sessionBindingFor(msg.FromUserID); sessionID != "" {
 			if err := ag.UseSession(ctx, msg.FromUserID, sessionID); err != nil {
 				log.Printf("[handler] failed to apply session binding for %s: %v", msg.FromUserID, err)
 			}
 		}
-		chatCtx, cancel := h.withLocalAgentTimeout(ctx)
-		defer cancel()
-		stopNotice := h.startSlowReplyNotice(chatCtx, client, msg)
-		defer stopNotice()
-
-		var err error
-		reply, err = h.chatWithAgent(chatCtx, ag, msg.FromUserID, text)
-		if err != nil {
-			reply = formatAgentError(err, h.localTimeout)
-		}
-	} else {
-		log.Printf("[handler] agent not ready, using echo mode for %s", msg.FromUserID)
-		reply = "[echo] " + text
+		h.sendAgentReplyWithBackground(ctx, client, msg, defaultName, ag, text, clientID, "")
+		return
 	}
 
+	log.Printf("[handler] agent not ready, using echo mode for %s", msg.FromUserID)
+	reply := "[echo] " + text
 	h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
 }
 
@@ -774,102 +822,155 @@ func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, ms
 	if agErr != nil {
 		log.Printf("[handler] agent %q not available: %v", name, agErr)
 		reply := fmt.Sprintf("Agent %q is not available: %v", name, agErr)
-		SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		h.sendTextReplyWithPending(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
 		return
 	}
 
-	chatCtx, cancel := h.withLocalAgentTimeout(ctx)
-	defer cancel()
-	stopNotice := h.startSlowReplyNotice(chatCtx, client, msg)
-	defer stopNotice()
-
-	reply, err := h.chatWithAgent(chatCtx, ag, msg.FromUserID, message)
-	if err != nil {
-		reply = formatAgentError(err, h.localTimeout)
-	}
-	h.sendReplyWithMedia(ctx, client, msg, name, reply, clientID)
+	h.sendAgentReplyWithBackground(ctx, client, msg, name, ag, message, clientID, "")
 }
 
 // broadcastToAgents sends the message to multiple agents in parallel.
 // Each reply is sent as a separate message with the agent name prefix.
 func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, names []string, message string) {
-	type result struct {
-		name  string
-		reply string
-	}
-
-	chatCtx, cancel := h.withLocalAgentTimeout(ctx)
-	defer cancel()
-	stopNotice := h.startSlowReplyNotice(chatCtx, client, msg)
-	defer stopNotice()
-
-	ch := make(chan result, len(names))
-
 	for _, name := range names {
-		go func(n string) {
-			ag, err := h.getAgent(chatCtx, n)
-			if err != nil {
-				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
-				return
-			}
-			reply, err := h.chatWithAgent(chatCtx, ag, msg.FromUserID, message)
-			if err != nil {
-				ch <- result{name: n, reply: formatAgentError(err, h.localTimeout)}
-				return
-			}
-			ch <- result{name: n, reply: reply}
-		}(name)
-	}
-
-	// Send replies as they arrive
-	for range names {
-		r := <-ch
-		reply := fmt.Sprintf("[%s] %s", r.name, r.reply)
-		clientID := NewClientID()
-		h.sendReplyWithMedia(ctx, client, msg, r.name, reply, clientID)
+		ag, err := h.getAgent(ctx, name)
+		if err != nil {
+			reply := fmt.Sprintf("[%s] Error: %v", name, err)
+			h.sendReplyWithMedia(ctx, client, msg, name, reply, NewClientID())
+			continue
+		}
+		h.sendAgentReplyWithBackground(ctx, client, msg, name, ag, message, NewClientID(), fmt.Sprintf("[%s] ", name))
 	}
 }
 
-// sendReplyWithMedia sends a text reply and any extracted image URLs.
+func (h *Handler) sendAgentReplyWithBackground(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, agentName string, ag agent.Agent, message, clientID, replyPrefix string) {
+	resultCh := make(chan agentReplyResult, 1)
+	bgCtx, cancel := h.withBackgroundAgentTimeout()
+	go func() {
+		defer cancel()
+		reply, err := h.chatWithAgent(bgCtx, ag, msg.FromUserID, message)
+		resultCh <- agentReplyResult{reply: reply, err: err}
+	}()
+
+	stopNotice := h.startSlowReplyNotice(ctx, client, msg)
+	foregroundTimer := time.NewTimer(h.localTimeout)
+	defer foregroundTimer.Stop()
+
+	select {
+	case result := <-resultCh:
+		stopNotice()
+		reply := result.reply
+		if result.err != nil {
+			reply = formatAgentError(result.err, h.backgroundTaskTimeout)
+		}
+		h.sendReplyWithMedia(ctx, client, msg, agentName, replyPrefix+reply, clientID)
+	case <-foregroundTimer.C:
+		stopNotice()
+		notice := "任务仍在后台执行，完成后会自动发送结果。"
+		h.sendTextReplyWithPending(ctx, client, msg.FromUserID, notice, msg.ContextToken, NewClientID())
+		go h.deliverBackgroundAgentResult(client, msg, agentName, resultCh, replyPrefix)
+	case <-ctx.Done():
+		stopNotice()
+		go h.deliverBackgroundAgentResult(client, msg, agentName, resultCh, replyPrefix)
+	}
+}
+
+func (h *Handler) deliverBackgroundAgentResult(client *ilink.Client, msg ilink.WeixinMessage, agentName string, resultCh <-chan agentReplyResult, replyPrefix string) {
+	result := <-resultCh
+	reply := result.reply
+	if result.err != nil {
+		reply = formatAgentError(result.err, h.backgroundTaskTimeout)
+	}
+	h.sendReplyWithMedia(context.Background(), client, msg, agentName, replyPrefix+reply, NewClientID())
+}
+
+func (h *Handler) withBackgroundAgentTimeout() (context.Context, context.CancelFunc) {
+	if h.backgroundTaskTimeout <= 0 {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), h.backgroundTaskTimeout)
+}
+
+// sendReplyWithMedia sends a text reply and any extracted media references.
 func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, agentName, reply, clientID string) {
 	imageURLs := ExtractImageURLs(reply)
 	attachmentPaths := extractLocalAttachmentPaths(reply)
 	allowedRoots := h.allowedAttachmentRoots(agentName)
-	textReply := rewriteReplyWithAttachmentResults(reply, attachmentPaths, nil)
 
-	if err := SendTextReply(ctx, client, msg.FromUserID, textReply, msg.ContextToken, clientID); err != nil {
-		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-	}
-
-	var failedPaths []string
+	var sentPaths, failedPaths []string
 	for _, attachmentPath := range attachmentPaths {
 		if !isAllowedAttachmentPath(attachmentPath, allowedRoots) {
 			log.Printf("[handler] rejected attachment outside allowed roots for agent %q: %s", agentName, attachmentPath)
 			failedPaths = append(failedPaths, attachmentPath)
 			continue
 		}
-		if err := SendMediaFromPath(ctx, client, msg.FromUserID, attachmentPath, msg.ContextToken); err != nil {
+		if err := handlerSendMediaFromPath(ctx, client, msg.FromUserID, attachmentPath, msg.ContextToken); err != nil {
 			log.Printf("[handler] failed to send attachment to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
+			h.queuePendingSend(client, msg.FromUserID, "", "", attachmentPath, err)
 			failedPaths = append(failedPaths, attachmentPath)
 			continue
 		}
+		sentPaths = append(sentPaths, attachmentPath)
 	}
-	if len(failedPaths) > 0 {
-		failureReply := rewriteReplyWithAttachmentResults("", nil, failedPaths)
-		if err := SendTextReply(ctx, client, msg.FromUserID, failureReply, msg.ContextToken, NewClientID()); err != nil {
-			log.Printf("[handler] failed to send attachment failure reply to %s: %v", msg.FromUserID, err)
-		}
-	}
+	textReply := rewriteReplyWithAttachmentResults(reply, sentPaths, failedPaths)
+	h.sendTextReplyWithPending(ctx, client, msg.FromUserID, textReply, msg.ContextToken, clientID)
 
 	for _, imgURL := range imageURLs {
-		if err := SendMediaFromURL(ctx, client, msg.FromUserID, imgURL, msg.ContextToken); err != nil {
+		if err := handlerSendMediaFromURL(ctx, client, msg.FromUserID, imgURL, msg.ContextToken); err != nil {
 			log.Printf("[handler] failed to send image to %s: %v", msg.FromUserID, err)
+			h.noteSendError(client, msg.FromUserID, err)
+			h.queuePendingSend(client, msg.FromUserID, "", imgURL, "", err)
 		}
 	}
 }
 
+func (h *Handler) sendTextReplyWithPending(ctx context.Context, client *ilink.Client, toUserID, text, contextToken, clientID string) {
+	if err := handlerSendTextReply(ctx, client, toUserID, text, contextToken, clientID); err != nil {
+		log.Printf("[handler] failed to send reply to %s: %v", toUserID, err)
+		h.noteSendError(client, toUserID, err)
+		h.queuePendingSend(client, toUserID, text, "", "", err)
+	}
+}
+
+func (h *Handler) queuePendingSend(client *ilink.Client, toUserID, text, mediaURL, mediaPath string, cause error) {
+	if !shouldQueuePendingOutgoing(cause) {
+		return
+	}
+	accountID := ""
+	if client != nil {
+		accountID = client.BotID()
+	}
+	path, err := SavePendingOutgoingSend(accountID, toUserID, text, mediaURL, mediaPath, cause.Error())
+	if err != nil {
+		log.Printf("[handler] queue pending send failed: %v", err)
+		return
+	}
+	if path != "" {
+		log.Printf("[handler] queued pending send: %s", path)
+	}
+}
+
+func shouldQueuePendingOutgoing(cause error) bool {
+	if cause == nil {
+		return false
+	}
+	if errors.Is(cause, ErrInvalidContext) {
+		return true
+	}
+	message := cause.Error()
+	return strings.Contains(message, "ret=-2") ||
+		strings.Contains(message, "CDN upload HTTP 5") ||
+		strings.Contains(message, "context deadline exceeded") ||
+		strings.Contains(message, "EOF")
+}
+
 func (h *Handler) allowedAttachmentRoots(agentName string) []string {
 	roots := []string{defaultAttachmentWorkspace()}
+	roots = append(roots, defaultUserAttachmentRoots()...)
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		roots = append(roots, cwd)
+	}
 
 	h.mu.RLock()
 	agentDir := h.agentWorkDirs[agentName]
@@ -886,6 +987,8 @@ func (h *Handler) allowedAttachmentRoots(agentName string) []string {
 func (h *Handler) chatWithAgent(ctx context.Context, ag agent.Agent, userID, message string) (string, error) {
 	info := ag.Info()
 	log.Printf("[handler] dispatching to agent (%s) for %s", info, userID)
+
+	message = h.messageForUserMode(userID, message)
 
 	start := time.Now()
 	reply, err := ag.Chat(ctx, userID, message)
@@ -957,9 +1060,7 @@ func (h *Handler) startSlowReplyNotice(ctx context.Context, client *ilink.Client
 		select {
 		case <-timer.C:
 			notice := "已收到，正在处理中，请稍候。"
-			if err := SendTextReply(ctx, client, msg.FromUserID, notice, msg.ContextToken, NewClientID()); err != nil {
-				log.Printf("[handler] failed to send slow-reply notice to %s: %v", msg.FromUserID, err)
-			}
+			h.sendTextReplyWithPending(ctx, client, msg.FromUserID, notice, msg.ContextToken, NewClientID())
 		case <-done:
 		case <-ctx.Done():
 		}
@@ -1209,10 +1310,63 @@ func saveSessionBindings(bindings map[string]string) error {
 func isBuiltInCommand(trimmed string) bool {
 	return trimmed == "/info" ||
 		trimmed == "/help" ||
+		trimmed == "/plan" ||
+		trimmed == "/exec" ||
+		trimmed == "/execute" ||
 		trimmed == "/new" ||
 		trimmed == "/clear" ||
 		strings.HasPrefix(trimmed, "/cwd") ||
 		strings.HasPrefix(trimmed, "/session")
+}
+
+func (h *Handler) setUserMode(userID string, mode string) {
+	userID = strings.TrimSpace(userID)
+	mode = strings.TrimSpace(mode)
+	if userID == "" || mode == "" {
+		return
+	}
+	h.userModes.Store(userID, mode)
+}
+
+func (h *Handler) clearUserMode(userID string) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	h.userModes.Delete(userID)
+}
+
+func (h *Handler) userMode(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return ""
+	}
+	value, ok := h.userModes.Load(userID)
+	if !ok {
+		return ""
+	}
+	mode, _ := value.(string)
+	return mode
+}
+
+func (h *Handler) messageForUserMode(userID string, message string) string {
+	if h.userMode(userID) != "plan" && h.userMode(ownerUserIDFromConversation(userID)) != "plan" {
+		return message
+	}
+	return `当前微信会话处于 Plan Mode。
+请只做只读分析、需求澄清和实施计划；不要修改文件、不要执行有副作用的命令、不要提交或推送代码。
+如果用户要求执行，请提醒用户先发送 /exec 切回执行模式。
+
+用户消息：
+` + message
+}
+
+func ownerUserIDFromConversation(conversationID string) string {
+	parts := strings.SplitN(strings.TrimSpace(conversationID), ":", 3)
+	if len(parts) == 3 && parts[0] == "owner" {
+		return strings.TrimSpace(parts[2])
+	}
+	return ""
 }
 
 // buildStatus returns a short status string showing the current default agent.
@@ -1239,6 +1393,8 @@ func buildHelpText() string {
 @agent msg or /agent msg - Send to a specific agent
 @a @b msg - Broadcast to multiple agents
 /new or /clear - Start a new session
+/plan - Enter planning mode
+/exec - Return to execution mode
 /cwd /path - Switch workspace directory
 /session <id> - Attach current chat to an existing agent session
 /info - Show current agent info

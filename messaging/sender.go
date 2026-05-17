@@ -78,6 +78,10 @@ func SendTextReply(ctx context.Context, client *ilink.Client, toUserID, text, co
 	}
 
 	if resp.Ret != 0 {
+		if resp.Ret == errCodeInvalidContext {
+			clearStaleContextToken(client, toUserID, "sender")
+			return invalidContextError("send message", resp.ErrMsg)
+		}
 		return fmt.Errorf("send message failed: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
 	}
 

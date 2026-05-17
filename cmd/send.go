@@ -15,12 +15,14 @@ var (
 	sendTo       string
 	sendText     string
 	sendMediaURL string
+	sendFilePath string
 )
 
 func init() {
 	sendCmd.Flags().StringVar(&sendTo, "to", "", "Target user ID (ilink user ID)")
 	sendCmd.Flags().StringVar(&sendText, "text", "", "Message text to send")
 	sendCmd.Flags().StringVar(&sendMediaURL, "media", "", "Media URL to send (image/video/file)")
+	sendCmd.Flags().StringVar(&sendFilePath, "file", "", "Local file path to send (image/video/file)")
 	sendCmd.MarkFlagRequired("to")
 	rootCmd.AddCommand(sendCmd)
 }
@@ -30,10 +32,11 @@ var sendCmd = &cobra.Command{
 	Short: "Send a message to a WeChat user",
 	Example: `  weclaw send --to "user_id@im.wechat" --text "Hello"
   weclaw send --to "user_id@im.wechat" --media "https://example.com/image.png"
+  weclaw send --to "user_id@im.wechat" --file "/home/ivan/Downloads/report.pdf"
   weclaw send --to "user_id@im.wechat" --text "See this" --media "https://example.com/image.png"`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if sendText == "" && sendMediaURL == "" {
-			return fmt.Errorf("at least one of --text or --media is required")
+		if sendText == "" && sendMediaURL == "" && sendFilePath == "" {
+			return fmt.Errorf("at least one of --text, --media, or --file is required")
 		}
 
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -61,6 +64,13 @@ var sendCmd = &cobra.Command{
 				return fmt.Errorf("send media failed: %w", err)
 			}
 			fmt.Println("Media sent")
+		}
+
+		if sendFilePath != "" {
+			if err := messaging.SendMediaFromPath(ctx, client, sendTo, sendFilePath, ""); err != nil {
+				return fmt.Errorf("send file failed: %w", err)
+			}
+			fmt.Println("File sent")
 		}
 
 		return nil
