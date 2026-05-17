@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,6 +17,8 @@ import (
 
 var sendCodexPendingTextReply = SendTextReply
 
+var pendingCodexReleaseAge = 15 * time.Minute
+
 type codexFailedNotification struct {
 	FailedAt      string `json:"failed_at"`
 	SessionID     string `json:"session_id"`
@@ -27,6 +30,8 @@ type codexFailedNotification struct {
 	Message       string `json:"message"`
 	RetryCount    int    `json:"retry_count,omitempty"`
 	LastAttemptAt string `json:"last_attempt_at,omitempty"`
+	Summary       bool   `json:"summary,omitempty"`
+	ReleasedCount int    `json:"released_count,omitempty"`
 }
 
 // RetryPendingCodexNotifications resends locally queued Codex Stop notifications.
@@ -52,6 +57,16 @@ func retryPendingCodexNotifications(ctx context.Context, client *ilink.Client, o
 		}
 		if len(files) == 0 {
 			return pendingRetryDone
+		}
+		result, released := releaseStaleCodexNotifications(ctx, client, files, onlyUserID, contextToken, budget)
+		if result == pendingRetryInvalidContext || result == pendingRetryBudgetExhausted {
+			return result
+		}
+		if released {
+			if result == pendingRetryDone {
+				return pendingRetryDone
+			}
+			continue
 		}
 		if !budget.allow() {
 			log.Printf("[codex-pending] retry limit reached, remaining notifications will be retried later")
@@ -124,6 +139,51 @@ func retryPendingCodexNotifications(ctx context.Context, client *ilink.Client, o
 	}
 }
 
+func releaseStaleCodexNotifications(ctx context.Context, client *ilink.Client, files []string, onlyUserID, contextToken string, budget *pendingRetryBudget) (pendingRetryResult, bool) {
+	group := collectStaleCodexReleaseGroup(files, onlyUserID, time.Now())
+	if len(group) == 0 {
+		return pendingRetryDone, false
+	}
+	if !budget.allow() {
+		log.Printf("[codex-pending] release summary skipped because retry budget is exhausted")
+		return pendingRetryBudgetExhausted, false
+	}
+
+	first := group[0]
+	message := buildCodexReleasedSummary(group)
+	token := ""
+	if onlyUserID != "" && first.item.To == onlyUserID {
+		token = contextToken
+	}
+	if err := sendCodexPendingTextReply(ctx, client, first.item.To, message, token, ""); err != nil {
+		log.Printf("[codex-pending] send released summary count=%d to=%s failed: %v", len(group), first.item.To, err)
+		if summaryPath, saveErr := saveCodexReleasedSummary(first.item.To, message, err, len(group)); saveErr != nil {
+			log.Printf("[codex-pending] save released summary failed: %v", saveErr)
+			if errors.Is(err, ErrInvalidContext) {
+				return pendingRetryInvalidContext, false
+			}
+			return pendingRetryDone, false
+		} else {
+			log.Printf("[codex-pending] queued released summary: %s", summaryPath)
+		}
+		moveCodexReleaseGroup(group)
+		if errors.Is(err, ErrInvalidContext) {
+			return pendingRetryInvalidContext, true
+		}
+		return pendingRetryDone, true
+	}
+
+	if !moveCodexReleaseGroup(group) {
+		return pendingRetryDone, true
+	}
+	budget.consume()
+	log.Printf("[codex-pending] released stale count=%d to=%s", len(group), first.item.To)
+	if budget.exhausted() {
+		return pendingRetryBudgetExhausted, true
+	}
+	return pendingRetryBatchSent, true
+}
+
 func retryMergedCodexNotifications(ctx context.Context, client *ilink.Client, files []string, onlyUserID, contextToken string, budget *pendingRetryBudget) pendingRetryResult {
 	group := collectCodexMergeGroup(files, onlyUserID)
 	if len(group) < 2 {
@@ -180,6 +240,9 @@ func collectCodexMergeGroup(files []string, onlyUserID string) []codexMergeEntry
 		if notification.To == "" || strings.TrimSpace(notification.Message) == "" {
 			continue
 		}
+		if notification.Summary {
+			continue
+		}
 		if onlyUserID != "" && notification.To != onlyUserID {
 			continue
 		}
@@ -202,6 +265,51 @@ func collectCodexMergeGroup(files []string, onlyUserID string) []codexMergeEntry
 	return group
 }
 
+func collectStaleCodexReleaseGroup(files []string, onlyUserID string, now time.Time) []codexMergeEntry {
+	var group []codexMergeEntry
+	target := ""
+	for _, path := range files {
+		notification, err := readCodexFailedNotification(path)
+		if err != nil {
+			log.Printf("[codex-pending] read stale candidate %s: %v", path, err)
+			continue
+		}
+		if notification.Summary || notification.To == "" || strings.TrimSpace(notification.Message) == "" {
+			continue
+		}
+		if onlyUserID != "" && notification.To != onlyUserID {
+			continue
+		}
+		stamp, err := codexNotificationFailedTime(path, notification)
+		if err != nil {
+			log.Printf("[codex-pending] stale age unavailable for %s: %v", path, err)
+			continue
+		}
+		if now.Sub(stamp) < pendingCodexReleaseAge {
+			continue
+		}
+		if target == "" {
+			target = notification.To
+		}
+		if notification.To != target {
+			continue
+		}
+		group = append(group, codexMergeEntry{path: path, item: notification})
+	}
+	return group
+}
+
+func moveCodexReleaseGroup(group []codexMergeEntry) bool {
+	movedAll := true
+	for _, entry := range group {
+		if err := moveCodexNotificationToReleased(entry.path); err != nil {
+			log.Printf("[codex-pending] release stale %s: %v", entry.path, err)
+			movedAll = false
+		}
+	}
+	return movedAll
+}
+
 func joinCodexNotifications(group []codexMergeEntry) string {
 	parts := make([]string, 0, len(group))
 	for _, entry := range group {
@@ -211,6 +319,99 @@ func joinCodexNotifications(group []codexMergeEntry) string {
 		}
 	}
 	return strings.Join(parts, "\n\n---\n\n")
+}
+
+func buildCodexReleasedSummary(group []codexMergeEntry) string {
+	lines := make([]string, 0, len(group)+2)
+	lines = append(lines, fmt.Sprintf("Codex pending 超过15分钟，已停止逐条重传，释放 %d 条任务：", len(group)))
+	for _, entry := range group {
+		lines = append(lines, summarizeCodexReleasedNotification(entry.item))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func summarizeCodexReleasedNotification(notification codexFailedNotification) string {
+	device := extractCodexMessageField(notification.Message, "设备:")
+	if device == "" {
+		device = "unknown"
+	}
+	cwd := strings.TrimSpace(notification.CWD)
+	if cwd == "" {
+		cwd = extractCodexMessageField(notification.Message, "目录:")
+	}
+	if cwd == "" {
+		cwd = "unknown"
+	}
+	sessionID := strings.TrimSpace(notification.SessionID)
+	if sessionID == "" {
+		sessionID = "unknown"
+	}
+	description := summarizeCodexMessageBody(notification.Message)
+	if description == "" {
+		description = "无任务描述"
+	}
+	return fmt.Sprintf("- 设备: %s | 文件夹: %s | 在线ID: %s | 任务: %s", oneLine(device, 80), oneLine(cwd, 160), oneLine(sessionID, 100), oneLine(description, 220))
+}
+
+func extractCodexMessageField(message, prefix string) string {
+	for _, line := range strings.Split(message, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
+}
+
+func summarizeCodexMessageBody(message string) string {
+	lines := strings.Split(message, "\n")
+	bodyStart := 0
+	for idx, line := range lines {
+		if strings.TrimSpace(line) == "" && idx >= 4 {
+			bodyStart = idx + 1
+			break
+		}
+	}
+	if bodyStart == 0 && len(lines) > 0 {
+		bodyStart = len(lines) - 1
+	}
+	var parts []string
+	for _, line := range lines[bodyStart:] {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if len(parts) > 0 {
+				break
+			}
+			continue
+		}
+		parts = append(parts, trimmed)
+	}
+	return strings.Join(parts, " ")
+}
+
+func oneLine(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if limit <= 0 || len([]rune(value)) <= limit {
+		return value
+	}
+	runes := []rune(value)
+	if limit <= 1 {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
+func codexNotificationFailedTime(path string, notification codexFailedNotification) (time.Time, error) {
+	if notification.FailedAt != "" {
+		if stamp, err := time.Parse(time.RFC3339, notification.FailedAt); err == nil {
+			return stamp, nil
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
 }
 
 func pendingCodexNotificationFiles() ([]string, error) {
@@ -288,6 +489,52 @@ func moveCodexNotificationToDead(path string) error {
 		target = base + "." + time.Now().Format("20060102-150405.000000000") + ext
 	}
 	return os.Rename(path, target)
+}
+
+func moveCodexNotificationToReleased(path string) error {
+	dir, err := codexNotifyLogDir("weclaw-notify-released")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	target := filepath.Join(dir, filepath.Base(path))
+	if _, err := os.Stat(target); err == nil {
+		ext := filepath.Ext(target)
+		base := strings.TrimSuffix(target, ext)
+		target = base + "." + time.Now().Format("20060102-150405.000000000") + ext
+	}
+	return os.Rename(path, target)
+}
+
+func saveCodexReleasedSummary(to, message string, cause error, releasedCount int) (string, error) {
+	dir, err := codexNotifyLogDir("weclaw-notify-failed")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	notification := codexFailedNotification{
+		FailedAt:      time.Now().Format(time.RFC3339),
+		SessionID:     "released-summary-" + time.Now().Format("20060102-150405.000000000"),
+		HookEventName: "Stop",
+		To:            to,
+		Error:         cause.Error(),
+		Message:       message,
+		Summary:       true,
+		ReleasedCount: releasedCount,
+	}
+	raw, err := json.MarshalIndent(notification, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, notification.SessionID+".json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func markCodexNotificationAttempt(path string, notification codexFailedNotification, cause error) bool {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,6 +144,235 @@ func TestRetryPendingCodexRetriesTextNotificationsOneByOne(t *testing.T) {
 	}
 	if len(files) != 0 {
 		t.Fatalf("pending codex files = %d, want 0", len(files))
+	}
+}
+
+func TestRetryPendingCodexReleasesStaleNotificationsAsSummary(t *testing.T) {
+	setPendingRetryDelayForTest(t, time.Millisecond)
+	t.Setenv("HOME", t.TempDir())
+	staleAt := time.Now().Add(-16 * time.Minute).Format(time.RFC3339)
+	writeCodexPending(t, "old-one.json", codexFailedNotification{
+		FailedAt:  staleAt,
+		SessionID: "session-one",
+		CWD:       "/work/one",
+		To:        "owner@im.wechat",
+		Message:   codexStopMessage("device-a", "/work/one", "第一个任务已经完成。\n\n更多细节"),
+	})
+	writeCodexPending(t, "old-two.json", codexFailedNotification{
+		FailedAt:  staleAt,
+		SessionID: "session-two",
+		CWD:       "/work/two",
+		To:        "owner@im.wechat",
+		Message:   codexStopMessage("device-b", "/work/two", "第二个任务已经完成。"),
+	})
+
+	client := ilink.NewClient(&ilink.Credentials{ILinkBotID: "bot@im.bot"})
+	var gotTexts []string
+	origSend := sendCodexPendingTextReply
+	t.Cleanup(func() {
+		sendCodexPendingTextReply = origSend
+	})
+	sendCodexPendingTextReply = func(_ context.Context, _ *ilink.Client, _ string, text string, _ string, _ string) error {
+		gotTexts = append(gotTexts, text)
+		return nil
+	}
+
+	result := retryPendingCodexNotifications(context.Background(), client, "owner@im.wechat", "fresh-token", newPendingRetryBudget())
+
+	if result != pendingRetryDone {
+		t.Fatalf("result = %v, want pendingRetryDone", result)
+	}
+	if len(gotTexts) != 1 {
+		t.Fatalf("sent texts = %#v, want one summary", gotTexts)
+	}
+	if !strings.Contains(gotTexts[0], "释放 2 条任务") ||
+		!strings.Contains(gotTexts[0], "设备: device-a | 文件夹: /work/one | 在线ID: session-one | 任务: 第一个任务已经完成。") ||
+		!strings.Contains(gotTexts[0], "设备: device-b | 文件夹: /work/two | 在线ID: session-two | 任务: 第二个任务已经完成。") {
+		t.Fatalf("summary text missing expected lines:\n%s", gotTexts[0])
+	}
+	files, err := pendingCodexNotificationFiles()
+	if err != nil {
+		t.Fatalf("pendingCodexNotificationFiles: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("pending codex files = %d, want 0", len(files))
+	}
+	released := codexReleasedFiles(t)
+	if len(released) != 2 {
+		t.Fatalf("released files = %d, want 2", len(released))
+	}
+}
+
+func TestRetryPendingCodexKeepsFreshNotificationsAfterStaleSummary(t *testing.T) {
+	setPendingRetryDelayForTest(t, time.Millisecond)
+	t.Setenv("HOME", t.TempDir())
+	writeCodexPending(t, "old.json", codexFailedNotification{
+		FailedAt:  time.Now().Add(-16 * time.Minute).Format(time.RFC3339),
+		SessionID: "old-session",
+		CWD:       "/work/old",
+		To:        "owner@im.wechat",
+		Message:   codexStopMessage("device-old", "/work/old", "旧任务完成。"),
+	})
+	writeCodexPending(t, "fresh.json", codexFailedNotification{
+		FailedAt:  time.Now().Add(-2 * time.Minute).Format(time.RFC3339),
+		SessionID: "fresh-session",
+		CWD:       "/work/fresh",
+		To:        "owner@im.wechat",
+		Message:   "fresh message",
+	})
+
+	client := ilink.NewClient(&ilink.Credentials{ILinkBotID: "bot@im.bot"})
+	var gotTexts []string
+	origSend := sendCodexPendingTextReply
+	t.Cleanup(func() {
+		sendCodexPendingTextReply = origSend
+	})
+	sendCodexPendingTextReply = func(_ context.Context, _ *ilink.Client, _ string, text string, _ string, _ string) error {
+		gotTexts = append(gotTexts, text)
+		return nil
+	}
+
+	result := retryPendingCodexNotifications(context.Background(), client, "owner@im.wechat", "fresh-token", newPendingRetryBudget())
+
+	if result != pendingRetryDone {
+		t.Fatalf("result = %v, want pendingRetryDone", result)
+	}
+	if len(gotTexts) != 2 {
+		t.Fatalf("sent texts = %#v, want summary then fresh", gotTexts)
+	}
+	if !strings.Contains(gotTexts[0], "释放 1 条任务") || gotTexts[1] != "fresh message" {
+		t.Fatalf("unexpected send order/texts: %#v", gotTexts)
+	}
+}
+
+func TestRetryPendingCodexSelectsFirstStaleTarget(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	now := time.Now()
+	writeCodexPending(t, "aa-fresh-other.json", codexFailedNotification{
+		FailedAt:  now.Add(-2 * time.Minute).Format(time.RFC3339),
+		SessionID: "fresh-other",
+		To:        "other@im.wechat",
+		Message:   "fresh other",
+	})
+	staleOwner := writeCodexPending(t, "bb-stale-owner.json", codexFailedNotification{
+		FailedAt:  now.Add(-16 * time.Minute).Format(time.RFC3339),
+		SessionID: "stale-owner",
+		To:        "owner@im.wechat",
+		Message:   "stale owner",
+	})
+	writeCodexPending(t, "cc-stale-other.json", codexFailedNotification{
+		FailedAt:  now.Add(-16 * time.Minute).Format(time.RFC3339),
+		SessionID: "stale-other",
+		To:        "other@im.wechat",
+		Message:   "stale other",
+	})
+	files, err := pendingCodexNotificationFiles()
+	if err != nil {
+		t.Fatalf("pendingCodexNotificationFiles: %v", err)
+	}
+
+	group := collectStaleCodexReleaseGroup(files, "", now)
+
+	if len(group) != 1 {
+		t.Fatalf("group len = %d, want 1: %#v", len(group), group)
+	}
+	if group[0].path != staleOwner {
+		t.Fatalf("group[0].path = %s, want %s", group[0].path, staleOwner)
+	}
+}
+
+func TestReleaseStaleCodexStopsWhenMoveToReleasedFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	path := writeCodexPending(t, "old.json", codexFailedNotification{
+		FailedAt:  time.Now().Add(-16 * time.Minute).Format(time.RFC3339),
+		SessionID: "old-session",
+		CWD:       "/work/old",
+		To:        "owner@im.wechat",
+		Message:   codexStopMessage("device-old", "/work/old", "旧任务完成。"),
+	})
+	releasedDir := filepath.Join(os.Getenv("HOME"), ".codex", "log", "weclaw-notify-released")
+	if err := os.MkdirAll(filepath.Dir(releasedDir), 0o700); err != nil {
+		t.Fatalf("mkdir codex log dir: %v", err)
+	}
+	if err := os.WriteFile(releasedDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write released dir blocker: %v", err)
+	}
+
+	client := ilink.NewClient(&ilink.Credentials{ILinkBotID: "bot@im.bot"})
+	calls := 0
+	origSend := sendCodexPendingTextReply
+	t.Cleanup(func() {
+		sendCodexPendingTextReply = origSend
+	})
+	sendCodexPendingTextReply = func(_ context.Context, _ *ilink.Client, _ string, _ string, _ string, _ string) error {
+		calls++
+		return nil
+	}
+	files, err := pendingCodexNotificationFiles()
+	if err != nil {
+		t.Fatalf("pendingCodexNotificationFiles: %v", err)
+	}
+
+	result, released := releaseStaleCodexNotifications(context.Background(), client, files, "owner@im.wechat", "fresh-token", newPendingRetryBudget())
+
+	if result != pendingRetryDone || !released {
+		t.Fatalf("result, released = %v, %v; want pendingRetryDone, true", result, released)
+	}
+	if calls != 1 {
+		t.Fatalf("send calls = %d, want 1", calls)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("pending file moved despite released-dir failure: %v", err)
+	}
+}
+
+func TestRetryPendingCodexQueuesSummaryWhenReleaseSummarySendFails(t *testing.T) {
+	setPendingRetryDelayForTest(t, time.Millisecond)
+	t.Setenv("HOME", t.TempDir())
+	writeCodexPending(t, "old.json", codexFailedNotification{
+		FailedAt:  time.Now().Add(-16 * time.Minute).Format(time.RFC3339),
+		SessionID: "old-session",
+		CWD:       "/work/old",
+		To:        "owner@im.wechat",
+		Message:   codexStopMessage("device-old", "/work/old", "旧任务完成。"),
+	})
+
+	client := ilink.NewClient(&ilink.Credentials{ILinkBotID: "bot@im.bot"})
+	calls := 0
+	origSend := sendCodexPendingTextReply
+	t.Cleanup(func() {
+		sendCodexPendingTextReply = origSend
+	})
+	sendCodexPendingTextReply = func(_ context.Context, _ *ilink.Client, _ string, _ string, _ string, _ string) error {
+		calls++
+		return errors.New("temporary send failure")
+	}
+
+	result := retryPendingCodexNotifications(context.Background(), client, "owner@im.wechat", "fresh-token", newPendingRetryBudget())
+
+	if result != pendingRetryDone {
+		t.Fatalf("result = %v, want pendingRetryDone", result)
+	}
+	if calls != 1 {
+		t.Fatalf("send calls = %d, want 1", calls)
+	}
+	files, err := pendingCodexNotificationFiles()
+	if err != nil {
+		t.Fatalf("pendingCodexNotificationFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("pending codex files = %d, want 1 summary", len(files))
+	}
+	summary, err := readCodexFailedNotification(files[0])
+	if err != nil {
+		t.Fatalf("read summary: %v", err)
+	}
+	if !summary.Summary || summary.ReleasedCount != 1 || !strings.Contains(summary.Message, "释放 1 条任务") {
+		t.Fatalf("summary notification = %#v", summary)
+	}
+	released := codexReleasedFiles(t)
+	if len(released) != 1 {
+		t.Fatalf("released files = %d, want 1", len(released))
 	}
 }
 
@@ -311,6 +541,26 @@ func writeCodexPending(t *testing.T, name string, item codexFailedNotification) 
 	path := filepath.Join(dir, name)
 	writeJSON(t, path, item)
 	return path
+}
+
+func codexReleasedFiles(t *testing.T) []string {
+	t.Helper()
+	dir := filepath.Join(os.Getenv("HOME"), ".codex", "log", "weclaw-notify-released")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read released dir: %v", err)
+	}
+	var files []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+			files = append(files, filepath.Join(dir, entry.Name()))
+		}
+	}
+	return files
+}
+
+func codexStopMessage(device, cwd, body string) string {
+	return "Codex 任务完成\n\nSession ID: generated\n目录: " + cwd + "\n设备: " + device + "\n\n" + body
 }
 
 func writeOutgoingPending(t *testing.T, name string, item PendingOutgoingSend) string {
