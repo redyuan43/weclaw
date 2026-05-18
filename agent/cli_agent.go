@@ -120,6 +120,17 @@ func (a *CLIAgent) SetCwd(cwd string) {
 	a.cwd = cwd
 }
 
+// CurrentSessionID returns the active CLI session for a conversation.
+func (a *CLIAgent) CurrentSessionID(conversationID string) string {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessions[conversationID]
+}
+
 // Chat sends a message to the CLI agent and returns the response.
 func (a *CLIAgent) Chat(ctx context.Context, conversationID string, message string) (string, error) {
 	switch a.name {

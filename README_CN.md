@@ -69,7 +69,9 @@ docker run -it -v ~/.weclaw:/root/.weclaw ghcr.io/fastclaw-ai/weclaw start
 | `/cc 解释一下这段代码`  | 通过别名发送             |
 | `/claude`               | 切换默认 Agent 为 Claude |
 | `/cwd /path/to/project` | 切换工作目录             |
-| `/new`                  | 开始新对话（清除会话）   |
+| `/new`                  | 开始新的 Codex 会话并显示旧/新 Thread ID |
+| `/session list`         | 列出本机最近的 Codex Thread ID |
+| `/session <id>`         | 切换到指定 Codex 会话    |
 | `/info`                 | 查看当前 Agent 信息      |
 | `/help`                 | 查看帮助信息             |
 

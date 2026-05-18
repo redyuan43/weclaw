@@ -331,6 +331,20 @@ func (a *ACPAgent) SetCwd(cwd string) {
 	a.cwd = cwd
 }
 
+// CurrentSessionID returns the active provider session/thread for a conversation.
+func (a *ACPAgent) CurrentSessionID(conversationID string) string {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.protocol == protocolCodexAppServer {
+		return a.threads[conversationID]
+	}
+	return a.sessions[conversationID]
+}
+
 // ResetSession clears the existing session for the given conversationID and
 // immediately creates a new one, returning the new session ID.
 func (a *ACPAgent) ResetSession(ctx context.Context, conversationID string) (string, error) {

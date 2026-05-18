@@ -3,6 +3,8 @@ package messaging
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +20,9 @@ type fakeAgent struct {
 	reply          string
 	err            error
 	resetSessionID string
+	currentSession string
+	useSessionID   string
+	resetConvID    string
 	wait           <-chan struct{}
 }
 
@@ -37,12 +42,19 @@ func (f *fakeAgent) Chat(ctx context.Context, conversationID string, message str
 	return f.reply, nil
 }
 
-func (f *fakeAgent) ResetSession(_ context.Context, _ string) (string, error) {
+func (f *fakeAgent) ResetSession(_ context.Context, conversationID string) (string, error) {
+	f.resetConvID = conversationID
 	return f.resetSessionID, nil
 }
 
-func (f *fakeAgent) UseSession(_ context.Context, _ string, _ string) error {
+func (f *fakeAgent) UseSession(_ context.Context, conversationID string, sessionID string) error {
+	f.lastConvID = conversationID
+	f.useSessionID = sessionID
 	return nil
+}
+
+func (f *fakeAgent) CurrentSessionID(_ string) string {
+	return f.currentSession
 }
 
 func (f *fakeAgent) Info() agent.AgentInfo {
@@ -167,6 +179,77 @@ func TestResolveAlias(t *testing.T) {
 	h.customAliases = map[string]string{"cc": "custom-claude"}
 	if got := h.resolveAlias("cc"); got != "custom-claude" {
 		t.Errorf("resolveAlias(cc) with custom = %q, want custom-claude", got)
+	}
+}
+
+func TestResetDefaultSessionShowsPreviousSessionAndPersistsNewBinding(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ag := &fakeAgent{
+		info:           agent.AgentInfo{Name: "codex", Type: "acp", Command: "/usr/bin/codex"},
+		currentSession: "old-thread",
+		resetSessionID: "new-thread",
+	}
+	h := NewHandler(nil, nil)
+	h.SetDefaultAgent("codex", ag)
+
+	got := h.resetDefaultSession(context.Background(), "user-1")
+
+	for _, want := range []string{"new-thread", "old-thread", "/session old-thread"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("reset reply missing %q: %s", want, got)
+		}
+	}
+	if ag.resetConvID != "user-1" {
+		t.Fatalf("reset conversation = %q, want user-1", ag.resetConvID)
+	}
+	if binding := h.sessionBindingFor("user-1"); binding != "new-thread" {
+		t.Fatalf("binding = %q, want new-thread", binding)
+	}
+	reloaded := loadSessionBindings()
+	if reloaded["user-1"] != "new-thread" {
+		t.Fatalf("persisted binding = %q, want new-thread", reloaded["user-1"])
+	}
+}
+
+func TestHandleSessionListMarksCurrentSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	currentID := "019e3aa2-3a9c-7031-b054-1bbe515f0086"
+	oldID := "019e3aa0-1085-7442-a7c1-92b71a3ba6f9"
+	writeTestCodexSession(t, home, oldID, time.Date(2026, 5, 18, 18, 27, 0, 0, time.Local))
+	writeTestCodexSession(t, home, currentID, time.Date(2026, 5, 18, 18, 29, 0, 0, time.Local))
+
+	h := NewHandler(nil, nil)
+	if err := h.setSessionBinding("user-1", currentID); err != nil {
+		t.Fatalf("setSessionBinding: %v", err)
+	}
+
+	got := h.handleSession(context.Background(), "user-1", "/session list")
+
+	for _, want := range []string{currentID + " *当前", oldID, "/session <id>"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("session list missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestHandleSessionNewUsesResetFlow(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ag := &fakeAgent{
+		info:           agent.AgentInfo{Name: "codex", Type: "acp", Command: "/usr/bin/codex"},
+		currentSession: "old-thread",
+		resetSessionID: "new-thread",
+	}
+	h := NewHandler(nil, nil)
+	h.SetDefaultAgent("codex", ag)
+
+	got := h.handleSession(context.Background(), "user-1", "/session new")
+
+	if !strings.Contains(got, "请使用 /new") {
+		t.Fatalf("session new should point users to /new, got %s", got)
+	}
+	if binding := h.sessionBindingFor("user-1"); binding != "" {
+		t.Fatalf("binding = %q, want empty", binding)
 	}
 }
 
@@ -462,5 +545,20 @@ func stubHandlerTextSender(t *testing.T, fn func(context.Context, *ilink.Client,
 		handlerSendTextReply = origText
 		handlerSendMediaFromURL = origURL
 		handlerSendMediaFromPath = origPath
+	}
+}
+
+func writeTestCodexSession(t *testing.T, home, threadID string, modTime time.Time) {
+	t.Helper()
+	dir := filepath.Join(home, ".codex", "sessions", "2026", "05", "18")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	path := filepath.Join(dir, "rollout-2026-05-18T18-29-30-"+threadID+".jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+	if err := os.Chtimes(path, modTime, modTime); err != nil {
+		t.Fatalf("chtimes session: %v", err)
 	}
 }

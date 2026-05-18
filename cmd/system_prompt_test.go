@@ -10,6 +10,9 @@ func TestComposeWeclawSystemPrompt_Default(t *testing.T) {
 	if got != weclawPrivacySystemPrompt {
 		t.Fatalf("composeWeclawSystemPrompt(\"\") = %q, want exact privacy prompt", got)
 	}
+	if !strings.Contains(got, "当前这个是 B.U.S公司 V 0.18版本的模型，Provider : 冯源。") {
+		t.Fatalf("composeWeclawSystemPrompt(\"\") missing public identity reply, got %q", got)
+	}
 }
 
 func TestComposeWeclawSystemPrompt_AppendsCustomPrompt(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1115,18 +1116,25 @@ func (h *Handler) switchDefault(ctx context.Context, name string) string {
 
 // resetDefaultSession resets the session for the given userID on the default agent.
 func (h *Handler) resetDefaultSession(ctx context.Context, userID string) string {
-	ag := h.getDefaultAgent()
-	if ag == nil {
-		return "No agent running."
+	ag, name, err := h.defaultAgentForCommand(ctx)
+	if err != nil {
+		return err.Error()
 	}
-	name := ag.Info().Name
+
+	oldSessionID := h.currentSessionID(ag, userID)
 	sessionID, err := ag.ResetSession(ctx, userID)
 	if err != nil {
 		log.Printf("[handler] reset session failed for %s: %v", userID, err)
+		if oldSessionID != "" {
+			return fmt.Sprintf("Failed to reset session: %v\n当前仍停留在原会话\n%s", err, oldSessionID)
+		}
 		return fmt.Sprintf("Failed to reset session: %v", err)
 	}
 	if sessionID != "" {
-		return fmt.Sprintf("已创建新的%s会话\n%s", name, sessionID)
+		if err := h.setSessionBinding(userID, sessionID); err != nil {
+			log.Printf("[handler] failed to persist new session binding for %s: %v", userID, err)
+		}
+		return formatNewSessionReply(name, sessionID, oldSessionID)
 	}
 	return fmt.Sprintf("已创建新的%s会话", name)
 }
@@ -1198,24 +1206,18 @@ func (h *Handler) handleCwd(trimmed string) string {
 func (h *Handler) handleSession(ctx context.Context, userID string, trimmed string) string {
 	sessionID := strings.TrimSpace(strings.TrimPrefix(trimmed, "/session"))
 	if sessionID == "" {
-		return "Usage: /session <codex-thread-id-or-session-id>"
+		return "Usage: /session list | /session <codex-thread-id-or-session-id>"
+	}
+	switch strings.ToLower(sessionID) {
+	case "new":
+		return "请使用 /new 创建新的 Codex 会话。"
+	case "list":
+		return h.handleSessionList(userID)
 	}
 
-	ag := h.getDefaultAgent()
-	if ag == nil {
-		name := ""
-		h.mu.RLock()
-		name = h.defaultName
-		h.mu.RUnlock()
-		if name == "" {
-			return "No agent configured."
-		}
-		var err error
-		ag, err = h.getAgent(ctx, name)
-		if err != nil {
-			log.Printf("[handler] failed to start agent %q for session bind: %v", name, err)
-			return fmt.Sprintf("Failed to start agent %q: %v", name, err)
-		}
+	ag, _, err := h.defaultAgentForCommand(ctx)
+	if err != nil {
+		return err.Error()
 	}
 
 	info := ag.Info()
@@ -1230,6 +1232,157 @@ func (h *Handler) handleSession(ctx context.Context, userID string, trimmed stri
 		return fmt.Sprintf("已接入 Codex 会话\n%s", sessionID)
 	}
 	return fmt.Sprintf("已接入%s会话\n%s", info.Name, sessionID)
+}
+
+func (h *Handler) handleSessionList(userID string) string {
+	sessions, err := listLocalCodexThreads(20)
+	if err != nil {
+		log.Printf("[handler] list sessions failed for %s: %v", userID, err)
+		return fmt.Sprintf("Failed to list sessions: %v", err)
+	}
+	if len(sessions) == 0 {
+		return "没有找到本机 Codex Thread 历史。"
+	}
+
+	currentID := h.sessionBindingFor(userID)
+	if ag := h.getDefaultAgent(); ag != nil {
+		if inspector, ok := ag.(agent.SessionInspector); ok {
+			if sessionID := inspector.CurrentSessionID(userID); sessionID != "" {
+				currentID = sessionID
+			}
+		}
+	}
+	lines := []string{"本机最近 Codex Thread:"}
+	for i, session := range sessions {
+		marker := ""
+		if session.ID == currentID {
+			marker = " *当前"
+		}
+		updated := ""
+		if !session.UpdatedAt.IsZero() {
+			updated = " " + session.UpdatedAt.Format("01-02 15:04")
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s%s%s", i+1, session.ID, marker, updated))
+	}
+	lines = append(lines, "\n切换: /session <id>")
+	return strings.Join(lines, "\n")
+}
+
+type localCodexThread struct {
+	ID        string
+	UpdatedAt time.Time
+}
+
+func listLocalCodexThreads(limit int) ([]localCodexThread, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	root := filepath.Join(home, ".codex", "sessions")
+	entries := make([]localCodexThread, 0)
+	seen := make(map[string]bool)
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			return nil
+		}
+		threadID := codexThreadIDFromSessionFile(entry.Name())
+		if threadID == "" || seen[threadID] {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		seen[threadID] = true
+		entries = append(entries, localCodexThread{
+			ID:        threadID,
+			UpdatedAt: info.ModTime(),
+		})
+		return nil
+	})
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].UpdatedAt.After(entries[j].UpdatedAt)
+	})
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
+}
+
+func codexThreadIDFromSessionFile(name string) string {
+	const uuidLen = 36
+	name = strings.TrimSuffix(name, ".jsonl")
+	if len(name) < uuidLen {
+		return ""
+	}
+	candidate := name[len(name)-uuidLen:]
+	if !isUUIDLike(candidate) {
+		return ""
+	}
+	return candidate
+}
+
+func isUUIDLike(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, r := range value {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') && !(r >= 'A' && r <= 'F') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (h *Handler) defaultAgentForCommand(ctx context.Context) (agent.Agent, string, error) {
+	h.mu.RLock()
+	name := h.defaultName
+	h.mu.RUnlock()
+	if name == "" {
+		return nil, "", fmt.Errorf("No agent configured.")
+	}
+	ag, err := h.getAgent(ctx, name)
+	if err != nil {
+		log.Printf("[handler] failed to start agent %q for session command: %v", name, err)
+		return nil, "", fmt.Errorf("Failed to start agent %q: %v", name, err)
+	}
+	return ag, name, nil
+}
+
+func (h *Handler) currentSessionID(ag agent.Agent, userID string) string {
+	if inspector, ok := ag.(agent.SessionInspector); ok {
+		if sessionID := inspector.CurrentSessionID(userID); sessionID != "" {
+			return sessionID
+		}
+	}
+	return h.sessionBindingFor(userID)
+}
+
+func formatNewSessionReply(agentName, newSessionID, oldSessionID string) string {
+	if agentName == "" {
+		agentName = "Agent"
+	}
+	if oldSessionID == "" {
+		return fmt.Sprintf("已创建新的%s会话\n\n当前会话:\n%s\n\n未找到可切回的上一个会话。", agentName, newSessionID)
+	}
+	return fmt.Sprintf("已创建新的%s会话\n\n当前会话:\n%s\n\n上一个会话:\n%s\n\n切回上一个会话:\n/session %s", agentName, newSessionID, oldSessionID, oldSessionID)
 }
 
 func (h *Handler) hasSessionBinding(userID string) bool {
@@ -1396,6 +1549,7 @@ func buildHelpText() string {
 /plan - Enter planning mode
 /exec - Return to execution mode
 /cwd /path - Switch workspace directory
+/session list - List recent local Codex threads
 /session <id> - Attach current chat to an existing agent session
 /info - Show current agent info
 /help - Show this help message

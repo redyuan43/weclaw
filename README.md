@@ -67,7 +67,9 @@ Send these as WeChat messages:
 | `/cc explain this code` | Send to agent by alias |
 | `/claude` | Switch default agent to Claude |
 | `/cwd /path/to/project` | Switch workspace directory |
-| `/new` | Start a new conversation (clear session) |
+| `/new` | Start a new Codex session and show old/new thread IDs |
+| `/session list` | List recent local Codex thread IDs |
+| `/session <id>` | Switch to a specific Codex session |
 | `/info` | Show current agent info |
 | `/help` | Show help message |
 

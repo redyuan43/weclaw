@@ -100,3 +100,9 @@ type Agent interface {
 	// SetCwd changes the working directory for subsequent operations.
 	SetCwd(cwd string)
 }
+
+// SessionInspector is implemented by agents that can expose the currently
+// bound provider session for a conversation.
+type SessionInspector interface {
+	CurrentSessionID(conversationID string) string
+}
